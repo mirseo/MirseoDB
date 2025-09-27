@@ -1,6 +1,6 @@
 mod modules;
 
-use modules::{start_health_server, AnySQL, Database};
+use modules::{start_health_server, AnySQL, ConfigManager, Database, RouteConfig};
 use std::env;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -28,6 +28,27 @@ fn main() {
         "[MirseoDB] AnySQL HYPERTHINKING engine initialized - All SQL dialects supported automatically!"
     );
 
+    let route_config = match RouteConfig::load() {
+        Ok(config) => {
+            println!("[MirseoDB] Route configuration loaded successfully");
+            Arc::new(config)
+        }
+        Err(e) => {
+            eprintln!("[MirseoDB] Route configuration failed to load: {}", e);
+            println!("[MirseoDB] Continuing without route forwarding...");
+            Arc::new(RouteConfig {
+                routes: std::collections::HashMap::new(),
+            })
+        }
+    };
+
+    let security_config = ConfigManager::load();
+    if security_config.sql_injection_protect {
+        println!("[MirseoDB] SQL injection protection enabled (SQL_INJECTON_PROTECT=1)");
+    } else {
+        println!("[MirseoDB] SQL injection protection disabled (SQL_INJECTON_PROTECT=0)");
+    }
+
     let api_token = env::var("MIRSEODB_API_TOKEN").ok();
     if api_token.is_some() {
         println!("[MirseoDB] API authentication enabled via MIRSEODB_API_TOKEN");
@@ -39,6 +60,7 @@ fn main() {
         DEFAULT_HEALTH_PORT,
         Arc::clone(&database),
         Arc::clone(&parser),
+        Arc::clone(&route_config),
         api_token,
     ) {
         Ok(port) => {
@@ -78,6 +100,8 @@ fn main() {
 
 fn initialize_database() -> Result<(Arc<Mutex<Database>>, String), modules::DatabaseError> {
     let db_name = "mirseodb".to_string();
+
+    ConfigManager::ensure_exists()?;
 
     println!("[MirseoDB] Loading database '{}'...", db_name);
 

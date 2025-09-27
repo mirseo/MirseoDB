@@ -1,5 +1,7 @@
 use super::anysql_parser::AnySQL;
+use super::config::ConfigManager;
 use super::database::Database;
+use super::route::{forward_request, should_forward_request, ForwardRequest, RouteConfig};
 use super::types::{DatabaseError, Row, SqlValue};
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -11,6 +13,16 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const MAX_PORT: u16 = 65535;
 const MAX_REQUEST_SIZE: usize = 64 * 1024;
 const READ_TIMEOUT: Duration = Duration::from_secs(2);
+
+const SUSPICIOUS_PATTERNS: &[(&str, &str)] = &[
+    ("' or '1'='1", "'"),
+    ("\" or \"1\"=\"1\"", "\""),
+    ("' or 1=1", "'"),
+    ("\" or 1=1", "\""),
+    (" or 1=1", " "),
+    (" or '1'='1", " "),
+    (" or \"1\"=\"1\"", " "),
+];
 
 struct HealthServerState {
     start_time: Instant,
@@ -56,6 +68,7 @@ struct ApiServerState {
     health: HealthServerState,
     database: Arc<Mutex<Database>>,
     parser: Arc<AnySQL>,
+    route_config: Arc<RouteConfig>,
     auth_token: Option<String>,
 }
 
@@ -63,12 +76,14 @@ impl ApiServerState {
     fn new(
         database: Arc<Mutex<Database>>,
         parser: Arc<AnySQL>,
+        route_config: Arc<RouteConfig>,
         auth_token: Option<String>,
     ) -> Self {
         Self {
             health: HealthServerState::new(),
             database,
             parser,
+            route_config,
             auth_token,
         }
     }
@@ -83,11 +98,17 @@ pub fn start_health_server(
     start_port: u16,
     database: Arc<Mutex<Database>>,
     parser: Arc<AnySQL>,
+    route_config: Arc<RouteConfig>,
     auth_token: Option<String>,
 ) -> std::io::Result<u16> {
     let listener = bind_available_port(start_port)?;
     let port = listener.local_addr()?.port();
-    let state = Arc::new(ApiServerState::new(database, parser, auth_token));
+    let state = Arc::new(ApiServerState::new(
+        database,
+        parser,
+        route_config,
+        auth_token,
+    ));
 
     thread::spawn({
         let state = Arc::clone(&state);
@@ -175,6 +196,12 @@ fn handle_query_request(
 ) -> HttpResponse {
     let start_time = Instant::now();
 
+    // Check if this is a forwarded request that should be ignored
+    if should_forward_request(headers) {
+        // This is a forwarded request, process normally but add forward mode indicator
+        return handle_forwarded_query_request(state, headers, body, start_time);
+    }
+
     if body.is_empty() {
         return HttpResponse::json(
             "400 Bad Request",
@@ -213,27 +240,44 @@ fn handle_query_request(
         }
     };
 
-    let provided_token = extract_auth_token(headers, request.auth_token);
+    let QueryRequest {
+        sql: mut sql_text,
+        auth_token: request_token,
+    } = request;
+
+    let provided_token = extract_auth_token(headers, request_token.clone());
+
+    let mut sanitized_applied = false;
+    let config = ConfigManager::load();
+    if config.sql_injection_protect {
+        if let Some(filtered) = sanitize_sql_input(&sql_text) {
+            sanitized_applied = true;
+            eprintln!("[MirseoDB][security] Suspicious SQL patterns detected; sanitized request");
+            sql_text = filtered;
+        }
+    }
 
     if let Some(expected) = state.auth_token.as_ref() {
         match provided_token {
             Some(ref token) if token == expected => {}
             _ => {
-                return HttpResponse::json(
-                    "401 Unauthorized",
-                    error_json("Invalid or missing auth token", start_time.elapsed()),
-                );
+                let mut body = error_json("Invalid or missing auth token", start_time.elapsed());
+                if sanitized_applied {
+                    insert_sanitized_flag(&mut body);
+                }
+                return HttpResponse::json("401 Unauthorized", body);
             }
         }
     }
 
-    let statement = match state.parser.parse(&request.sql) {
+    let statement = match state.parser.parse(&sql_text) {
         Ok(stmt) => stmt,
         Err(err) => {
-            return HttpResponse::json(
-                "400 Bad Request",
-                error_json(&format!("SQL parse error: {:?}", err), start_time.elapsed()),
-            );
+            let mut body = error_json(&format!("SQL parse error: {:?}", err), start_time.elapsed());
+            if sanitized_applied {
+                insert_sanitized_flag(&mut body);
+            }
+            return HttpResponse::json("400 Bad Request", body);
         }
     };
 
@@ -269,15 +313,30 @@ fn handle_query_request(
             }
             append_execution_time(&mut body, elapsed);
             body.push('}');
+            if sanitized_applied {
+                insert_sanitized_flag(&mut body);
+            }
 
             HttpResponse::json("200 OK", body)
         }
         Err(err) => {
             let elapsed = start_time.elapsed();
-            HttpResponse::json(
-                "400 Bad Request",
-                error_json(&database_error_to_string(err), elapsed),
-            )
+
+            // Check if we should forward the request to another server
+            if let Some(fallback_server) = state.route_config.get_fallback_server() {
+                if let Ok(forward_result) =
+                    attempt_forward_request(state, headers, body, fallback_server)
+                {
+                    return forward_result;
+                }
+            }
+
+            let mut body = error_json(&database_error_to_string(err), elapsed);
+            if sanitized_applied {
+                insert_sanitized_flag(&mut body);
+            }
+
+            HttpResponse::json("400 Bad Request", body)
         }
     }
 }
@@ -425,6 +484,67 @@ fn append_sql_value(out: &mut String, value: &SqlValue) {
         }
         SqlValue::Boolean(v) => out.push_str(if *v { "true" } else { "false" }),
         SqlValue::Null => out.push_str("null"),
+    }
+}
+
+fn sanitize_sql_input(sql: &str) -> Option<String> {
+    let mut sanitized = sql.to_string();
+    let mut modified = false;
+
+    for (pattern, replacement) in SUSPICIOUS_PATTERNS.iter() {
+        let (updated, changed) = replace_case_insensitive(&sanitized, pattern, replacement);
+        if changed {
+            sanitized = updated;
+            modified = true;
+        }
+    }
+
+    if modified {
+        Some(sanitized)
+    } else {
+        None
+    }
+}
+
+fn replace_case_insensitive(input: &str, pattern: &str, replacement: &str) -> (String, bool) {
+    if pattern.is_empty() {
+        return (input.to_string(), false);
+    }
+
+    let pattern_lower = pattern.to_ascii_lowercase();
+    let input_lower = input.to_ascii_lowercase();
+
+    if !input_lower.contains(&pattern_lower) {
+        return (input.to_string(), false);
+    }
+
+    let pattern_bytes = pattern_lower.as_bytes();
+    let pattern_len = pattern_bytes.len();
+    let lower_bytes = input_lower.as_bytes();
+
+    let mut result = String::with_capacity(input.len());
+    let mut last_index = 0usize;
+    let mut index = 0usize;
+
+    while index <= lower_bytes.len().saturating_sub(pattern_len) {
+        if &lower_bytes[index..index + pattern_len] == pattern_bytes {
+            result.push_str(&input[last_index..index]);
+            result.push_str(replacement);
+            index += pattern_len;
+            last_index = index;
+        } else {
+            index += 1;
+        }
+    }
+
+    result.push_str(&input[last_index..]);
+
+    (result, true)
+}
+
+fn insert_sanitized_flag(body: &mut String) {
+    if let Some(pos) = body.rfind('}') {
+        body.insert_str(pos, ",\"sanitized\":true");
     }
 }
 
@@ -675,4 +795,207 @@ fn normalize_header_key(key: &str) -> String {
     }
 
     normalized
+}
+
+fn handle_forwarded_query_request(
+    state: &Arc<ApiServerState>,
+    headers: &HashMap<String, String>,
+    body: &[u8],
+    start_time: Instant,
+) -> HttpResponse {
+    // This is a forwarded request, process it normally but indicate it's in forward mode
+    if body.is_empty() {
+        return HttpResponse::json(
+            "400 Bad Request",
+            error_json_with_mode("Request body cannot be empty", start_time.elapsed(), true),
+        );
+    }
+
+    let content_type =
+        find_header(headers, "content-type").map(|value| normalize_content_type(value));
+
+    if let Some(ref ct) = content_type {
+        let supported = ct.contains("application/json") || ct.contains("application/sql");
+        if !supported {
+            return HttpResponse::json(
+                "415 Unsupported Media Type",
+                error_json_with_mode(
+                    "Supported content types are application/json and application/sql",
+                    start_time.elapsed(),
+                    true,
+                ),
+            );
+        }
+    }
+
+    let allow_raw_sql = content_type
+        .as_ref()
+        .map(|ct| ct.contains("application/sql"))
+        .unwrap_or(false);
+
+    let request = match parse_query_payload(body, allow_raw_sql) {
+        Ok(req) => req,
+        Err(message) => {
+            return HttpResponse::json(
+                "400 Bad Request",
+                error_json_with_mode(&message, start_time.elapsed(), true),
+            );
+        }
+    };
+
+    let QueryRequest {
+        sql: mut sql_text,
+        auth_token: request_token,
+    } = request;
+
+    let provided_token = extract_auth_token(headers, request_token.clone());
+
+    let mut sanitized_applied = false;
+    let config = ConfigManager::load();
+    if config.sql_injection_protect {
+        if let Some(filtered) = sanitize_sql_input(&sql_text) {
+            sanitized_applied = true;
+            eprintln!(
+                "[MirseoDB][security] Suspicious SQL patterns detected; sanitized forwarded request"
+            );
+            sql_text = filtered;
+        }
+    }
+
+    if let Some(expected) = state.auth_token.as_ref() {
+        match provided_token {
+            Some(ref token) if token == expected => {}
+            _ => {
+                let mut body = error_json_with_mode(
+                    "Invalid or missing auth token",
+                    start_time.elapsed(),
+                    true,
+                );
+                if sanitized_applied {
+                    insert_sanitized_flag(&mut body);
+                }
+                return HttpResponse::json("401 Unauthorized", body);
+            }
+        }
+    }
+
+    let statement = match state.parser.parse(&sql_text) {
+        Ok(stmt) => stmt,
+        Err(err) => {
+            let mut body = error_json_with_mode(
+                &format!("SQL parse error: {:?}", err),
+                start_time.elapsed(),
+                true,
+            );
+            if sanitized_applied {
+                insert_sanitized_flag(&mut body);
+            }
+            return HttpResponse::json("400 Bad Request", body);
+        }
+    };
+
+    let execution_result = {
+        let mut db = match state.database.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                return HttpResponse::json(
+                    "500 Internal Server Error",
+                    error_json_with_mode(
+                        &format!("Database lock poisoned: {}", poisoned),
+                        start_time.elapsed(),
+                        true,
+                    ),
+                );
+            }
+        };
+
+        db.execute(statement)
+    };
+
+    match execution_result {
+        Ok(rows) => {
+            let elapsed = start_time.elapsed();
+            let mut body = String::from("{");
+            body.push_str("\"status\":\"ok\"");
+            body.push_str(",\"status_code\":200");
+            body.push_str(",\"mode\":\"fd\""); // Indicate forward mode
+            body.push_str(",\"row_count\":");
+            body.push_str(&rows.len().to_string());
+            body.push_str(",\"rows\":");
+            body.push_str(&rows_to_json(&rows));
+            if rows.is_empty() {
+                body.push_str(",\"message\":\"Command executed successfully\"");
+            }
+            append_execution_time(&mut body, elapsed);
+            body.push('}');
+            if sanitized_applied {
+                insert_sanitized_flag(&mut body);
+            }
+
+            HttpResponse::json("200 OK", body)
+        }
+        Err(err) => {
+            let elapsed = start_time.elapsed();
+            let mut body = error_json_with_mode(&database_error_to_string(err), elapsed, true);
+            if sanitized_applied {
+                insert_sanitized_flag(&mut body);
+            }
+            HttpResponse::json("400 Bad Request", body)
+        }
+    }
+}
+
+fn attempt_forward_request(
+    _state: &Arc<ApiServerState>,
+    headers: &HashMap<String, String>,
+    body: &[u8],
+    target_url: &str,
+) -> Result<HttpResponse, String> {
+    // Create forward request
+    let forward_payload = ForwardRequest {
+        method: "POST".to_string(),
+        path: "/query".to_string(),
+        headers: headers.clone(),
+        body: body.to_vec(),
+    };
+
+    // Forward the request
+    match forward_request(target_url, &forward_payload) {
+        Ok(response) => {
+            let mut response_body = response.body;
+
+            // If the response doesn't contain mode:fd, add it to indicate forwarding occurred
+            if !response_body.contains("\"mode\":\"fd\"") && response_body.starts_with('{') {
+                // Insert mode:fd into the JSON response
+                let close_brace_pos = response_body.rfind('}');
+                if let Some(pos) = close_brace_pos {
+                    response_body.insert_str(pos, ",\"mode\":\"fd\",\"forwarded\":true");
+                }
+            }
+
+            let status = if response.status_code == 200 {
+                "200 OK"
+            } else {
+                "400 Bad Request"
+            };
+            Ok(HttpResponse::json(status, response_body))
+        }
+        Err(e) => {
+            eprintln!("[MirseoDB] Forward request failed: {}", e);
+            Err(e)
+        }
+    }
+}
+
+fn error_json_with_mode(message: &str, elapsed: Duration, forward_mode: bool) -> String {
+    let mut body = String::from("{");
+    body.push_str("\"error\":\"");
+    body.push_str(&escape_json_string(message));
+    body.push_str("\"");
+    if forward_mode {
+        body.push_str(",\"mode\":\"fd\"");
+    }
+    append_execution_time(&mut body, elapsed);
+    body.push('}');
+    body
 }

@@ -1,4 +1,5 @@
 use super::btree::IndexManager;
+use super::config::ConfigManager;
 use super::storage::StorageEngine;
 use super::types::{
     ColumnDefinition, ComparisonOperator, DatabaseError, Row, SqlStatement, SqlValue, Table,
@@ -41,7 +42,22 @@ impl Database {
             DatabaseError::IoError(format!("Failed to create database file: {}", e))
         })?;
 
+        // Create route.cfg file in .mirseoDB directory
+        let route_cfg_path = mirseo_db_dir.join("route.cfg");
+        let route_cfg_content = format!(
+            "# Route Configuration for MirseoDB Database: {}\n# Format: route_name=server_url\n# Example: backup_server=http://192.168.1.100:3306\n# Example: analytics_server=http://analytics.company.com:3306\n\n# Default fallback server (uncomment and configure as needed)\n# fallback=http://localhost:3307\n\n# Additional route examples:\n# primary_db=http://primary.database.local:3306\n# secondary_db=http://secondary.database.local:3306\n# analytics=http://analytics.server.local:3306\n",
+            name
+        );
+
+        fs::write(&route_cfg_path, route_cfg_content).map_err(|e| {
+            DatabaseError::IoError(format!("Failed to create route.cfg file: {}", e))
+        })?;
+
         println!("Database '{}' created at {}", name, db_file_path.display());
+        println!("Route configuration created at {}", route_cfg_path.display());
+
+        // Ensure config exists with defaults on first creation
+        ConfigManager::ensure_exists()?;
 
         // Create and return new database instance
         Ok(Self::new(name))

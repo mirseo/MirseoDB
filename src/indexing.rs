@@ -1,4 +1,4 @@
-use super::types::{DatabaseError, SqlValue};
+use super::core_types::{DatabaseError, SqlValue};
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 

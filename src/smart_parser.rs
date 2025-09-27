@@ -1,5 +1,5 @@
-use super::identifier::{normalize_identifier, normalize_table_name};
-use super::types::{
+use super::security::{normalize_identifier, normalize_table_name};
+use super::core_types::{
     ColumnDefinition, ComparisonOperator, DataType, DatabaseError, SqlStatement, SqlValue,
     WhereClause,
 };

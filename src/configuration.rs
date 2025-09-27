@@ -2,7 +2,7 @@ use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-use super::types::DatabaseError;
+use super::core_types::DatabaseError;
 
 const CONFIG_DIR: &str = ".mirseoDB";
 const CONFIG_FILE: &str = "config.cfg";

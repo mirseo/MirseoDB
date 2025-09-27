@@ -1,7 +1,7 @@
-use super::btree::IndexManager;
-use super::config::ConfigManager;
-use super::storage::StorageEngine;
-use super::types::{
+use super::indexing::{IndexManager, IndexKey};
+use super::configuration::ConfigManager;
+use super::persistence::StorageEngine;
+use super::core_types::{
     ColumnDefinition, ComparisonOperator, DatabaseError, Row, SqlStatement, SqlValue, Table,
     WhereClause,
 };
@@ -383,7 +383,7 @@ impl Database {
                         let all_keys = index.get_all_keys();
                         let mut result = Vec::new();
                         for key in all_keys {
-                            if key != super::btree::IndexKey::from(&where_clause.value) {
+                            if key != IndexKey::from(&where_clause.value) {
                                 if let Ok(sql_value) = self.index_key_to_sql_value(&key) {
                                     result.extend(index.find_exact(&sql_value));
                                 }
@@ -455,14 +455,14 @@ impl Database {
 
     fn index_key_to_sql_value(
         &self,
-        key: &super::btree::IndexKey,
+        key: &IndexKey,
     ) -> Result<SqlValue, DatabaseError> {
         match key {
-            super::btree::IndexKey::Integer(i) => Ok(SqlValue::Integer(*i)),
-            super::btree::IndexKey::Float(f) => Ok(SqlValue::Float(f.value())),
-            super::btree::IndexKey::Text(s) => Ok(SqlValue::Text(s.clone())),
-            super::btree::IndexKey::Boolean(b) => Ok(SqlValue::Boolean(*b)),
-            super::btree::IndexKey::Null => Ok(SqlValue::Null),
+            IndexKey::Integer(i) => Ok(SqlValue::Integer(*i)),
+            IndexKey::Float(f) => Ok(SqlValue::Float(f.value())),
+            IndexKey::Text(s) => Ok(SqlValue::Text(s.clone())),
+            IndexKey::Boolean(b) => Ok(SqlValue::Boolean(*b)),
+            IndexKey::Null => Ok(SqlValue::Null),
         }
     }
 }

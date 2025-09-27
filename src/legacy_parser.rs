@@ -1,4 +1,4 @@
-use super::types::{
+use super::core_types::{
     ColumnDefinition, ComparisonOperator, DataType, DatabaseError, SqlStatement, SqlValue,
     WhereClause,
 };

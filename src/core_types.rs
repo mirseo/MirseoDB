@@ -19,7 +19,7 @@ pub struct Table {
     pub name: String,
     pub columns: Vec<ColumnDefinition>,
     pub rows: Vec<Row>,
-    pub index_manager: super::btree::IndexManager,
+    pub index_manager: super::indexing::IndexManager,
     pub next_row_id: usize,
 }
 

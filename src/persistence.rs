@@ -1,5 +1,5 @@
-use super::indexing::IndexManager;
 use super::core_types::{ColumnDefinition, DataType, DatabaseError, Row, SqlValue, Table};
+use super::indexing::IndexManager;
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};

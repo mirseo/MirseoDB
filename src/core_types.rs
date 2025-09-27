@@ -67,6 +67,55 @@ pub enum SqlStatement {
         table_name: String,
         where_clause: Option<WhereClause>,
     },
+    DropTable {
+        table_name: String,
+    },
+    DropDatabase {
+        database_name: String,
+    },
+    AlterTable {
+        table_name: String,
+        action: AlterAction,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub enum AlterAction {
+    AddColumn { column: ColumnDefinition },
+    DropColumn { column_name: String },
+    ModifyColumn { column: ColumnDefinition },
+}
+
+impl SqlStatement {
+    /// 민감한 SQL 작업인지 확인 (2차 인증이 필요한 작업)
+    pub fn requires_2fa(&self) -> bool {
+        match self {
+            SqlStatement::DropTable { .. } => true,
+            SqlStatement::DropDatabase { .. } => true,
+            SqlStatement::AlterTable { .. } => true,
+            SqlStatement::Delete {
+                where_clause: None, ..
+            } => true, // WHERE 절이 없는 DELETE는 위험
+            SqlStatement::Update {
+                where_clause: None, ..
+            } => true, // WHERE 절이 없는 UPDATE는 위험
+            _ => false,
+        }
+    }
+
+    pub fn get_operation_name(&self) -> &'static str {
+        match self {
+            SqlStatement::CreateDatabase { .. } => "CREATE DATABASE",
+            SqlStatement::CreateTable { .. } => "CREATE TABLE",
+            SqlStatement::Insert { .. } => "INSERT",
+            SqlStatement::Select { .. } => "SELECT",
+            SqlStatement::Update { .. } => "UPDATE",
+            SqlStatement::Delete { .. } => "DELETE",
+            SqlStatement::DropTable { .. } => "DROP TABLE",
+            SqlStatement::DropDatabase { .. } => "DROP DATABASE",
+            SqlStatement::AlterTable { .. } => "ALTER TABLE",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

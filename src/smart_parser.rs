@@ -1,8 +1,8 @@
-use super::security::{normalize_identifier, normalize_table_name};
 use super::core_types::{
     ColumnDefinition, ComparisonOperator, DataType, DatabaseError, SqlStatement, SqlValue,
     WhereClause,
 };
+use super::security::{normalize_identifier, normalize_table_name};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
@@ -117,6 +117,9 @@ impl AnySQL {
             StatementType::Select => self.parse_select_anysql(sql),
             StatementType::Update => self.parse_update_anysql(sql),
             StatementType::Delete => self.parse_delete_anysql(sql),
+            StatementType::DropTable => self.parse_drop_table_anysql(sql),
+            StatementType::DropDatabase => self.parse_drop_database_anysql(sql),
+            StatementType::AlterTable => self.parse_alter_table_anysql(sql),
         }
     }
 
@@ -139,6 +142,14 @@ impl AnySQL {
                     StatementType::CreateTable
                 }
             }
+            "DROP" => {
+                if tokens.len() > 1 && tokens[1] == "DATABASE" {
+                    StatementType::DropDatabase
+                } else {
+                    StatementType::DropTable
+                }
+            }
+            "ALTER" => StatementType::AlterTable,
             "INSERT" | "INSERT_INTO" => StatementType::Insert,
             "SELECT" => StatementType::Select,
             "UPDATE" => StatementType::Update,
@@ -650,6 +661,121 @@ impl AnySQL {
         // Default to text
         Ok(SqlValue::Text(value_str.to_string()))
     }
+
+    fn parse_drop_table_anysql(&self, sql: &str) -> Result<SqlStatement, DatabaseError> {
+        let tokens: Vec<&str> = sql.trim().split_whitespace().collect();
+
+        if tokens.len() < 3 {
+            return Err(DatabaseError::ParseError(
+                "Invalid DROP TABLE syntax".to_string(),
+            ));
+        }
+
+        let table_name = normalize_table_name(tokens[2]);
+        Ok(SqlStatement::DropTable { table_name })
+    }
+
+    fn parse_drop_database_anysql(&self, sql: &str) -> Result<SqlStatement, DatabaseError> {
+        let tokens: Vec<&str> = sql.trim().split_whitespace().collect();
+
+        if tokens.len() < 3 {
+            return Err(DatabaseError::ParseError(
+                "Invalid DROP DATABASE syntax".to_string(),
+            ));
+        }
+
+        let database_name = normalize_table_name(tokens[2]);
+        Ok(SqlStatement::DropDatabase { database_name })
+    }
+
+    fn parse_alter_table_anysql(&self, sql: &str) -> Result<SqlStatement, DatabaseError> {
+        use super::core_types::AlterAction;
+
+        let tokens: Vec<&str> = sql.trim().split_whitespace().collect();
+
+        if tokens.len() < 4 {
+            return Err(DatabaseError::ParseError(
+                "Invalid ALTER TABLE syntax".to_string(),
+            ));
+        }
+
+        let table_name = normalize_table_name(tokens[2]);
+
+        // ALTER TABLE table_name ADD/DROP/MODIFY COLUMN ...
+        let action = match tokens[3].to_uppercase().as_str() {
+            "ADD" => {
+                if tokens.len() >= 6 && tokens[4].to_uppercase() == "COLUMN" {
+                    // ALTER TABLE table_name ADD COLUMN column_name data_type
+                    let column_name = normalize_identifier(tokens[5]);
+                    let data_type = if tokens.len() > 6 {
+                        self.parse_data_type_anysql(tokens[6])?
+                    } else {
+                        return Err(DatabaseError::ParseError(
+                            "Missing data type in ADD COLUMN".to_string(),
+                        ));
+                    };
+
+                    AlterAction::AddColumn {
+                        column: ColumnDefinition {
+                            name: column_name,
+                            data_type,
+                            nullable: true, // Default to nullable
+                            primary_key: false,
+                        },
+                    }
+                } else {
+                    return Err(DatabaseError::ParseError(
+                        "Invalid ADD syntax in ALTER TABLE".to_string(),
+                    ));
+                }
+            }
+            "DROP" => {
+                if tokens.len() >= 6 && tokens[4].to_uppercase() == "COLUMN" {
+                    // ALTER TABLE table_name DROP COLUMN column_name
+                    let column_name = normalize_identifier(tokens[5]);
+                    AlterAction::DropColumn { column_name }
+                } else {
+                    return Err(DatabaseError::ParseError(
+                        "Invalid DROP syntax in ALTER TABLE".to_string(),
+                    ));
+                }
+            }
+            "MODIFY" => {
+                if tokens.len() >= 6 && tokens[4].to_uppercase() == "COLUMN" {
+                    // ALTER TABLE table_name MODIFY COLUMN column_name data_type
+                    let column_name = normalize_identifier(tokens[5]);
+                    let data_type = if tokens.len() > 6 {
+                        self.parse_data_type_anysql(tokens[6])?
+                    } else {
+                        return Err(DatabaseError::ParseError(
+                            "Missing data type in MODIFY COLUMN".to_string(),
+                        ));
+                    };
+
+                    AlterAction::ModifyColumn {
+                        column: ColumnDefinition {
+                            name: column_name,
+                            data_type,
+                            nullable: true, // Default to nullable
+                            primary_key: false,
+                        },
+                    }
+                } else {
+                    return Err(DatabaseError::ParseError(
+                        "Invalid MODIFY syntax in ALTER TABLE".to_string(),
+                    ));
+                }
+            }
+            _ => {
+                return Err(DatabaseError::ParseError(format!(
+                    "Unsupported ALTER TABLE action: {}",
+                    tokens[3]
+                )));
+            }
+        };
+
+        Ok(SqlStatement::AlterTable { table_name, action })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -668,6 +794,9 @@ enum StatementType {
     Select,
     Update,
     Delete,
+    DropTable,
+    DropDatabase,
+    AlterTable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

@@ -1,14 +1,20 @@
-use super::smart_parser::AnySQL;
+use super::auth::AuthConfig;
 use super::configuration::ConfigManager;
+use super::core_types::{DatabaseError, Row, SqlValue};
 use super::engine::Database;
 use super::routing::{forward_request, should_forward_request, ForwardRequest, RouteConfig};
-use super::core_types::{DatabaseError, Row, SqlValue};
+use super::smart_parser::AnySQL;
+use super::two_factor_auth::TwoFactorAuth;
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{Shutdown, TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use time::format_description::well_known::Rfc3339;
+use time::OffsetDateTime;
+
+const CONSOLE_PROXY_ADDR: &str = "127.0.0.1:5173";
 
 const MAX_PORT: u16 = 65535;
 const MAX_REQUEST_SIZE: usize = 64 * 1024;
@@ -70,6 +76,7 @@ struct ApiServerState {
     parser: Arc<AnySQL>,
     route_config: Arc<RouteConfig>,
     auth_token: Option<String>,
+    two_factor_auth: Arc<Mutex<TwoFactorAuth>>,
 }
 
 impl ApiServerState {
@@ -79,12 +86,15 @@ impl ApiServerState {
         route_config: Arc<RouteConfig>,
         auth_token: Option<String>,
     ) -> Self {
+        let two_factor_auth = TwoFactorAuth::load().unwrap_or_else(|_| TwoFactorAuth::new());
+
         Self {
             health: HealthServerState::new(),
             database,
             parser,
             route_config,
             auth_token,
+            two_factor_auth: Arc::new(Mutex::new(two_factor_auth)),
         }
     }
 }
@@ -92,6 +102,8 @@ impl ApiServerState {
 struct QueryRequest {
     sql: String,
     auth_token: Option<String>,
+    totp_token: Option<String>, // 2차 인증 토큰
+    email: Option<String>,      // 사용자 이메일
 }
 
 pub fn start_health_server(
@@ -115,7 +127,10 @@ pub fn start_health_server(
         move || {
             for stream in listener.incoming() {
                 match stream {
-                    Ok(stream) => handle_client(stream, Arc::clone(&state)),
+                    Ok(stream) => {
+                        let state = Arc::clone(&state);
+                        thread::spawn(move || handle_client(stream, state));
+                    }
                     Err(e) => eprintln!("[MirseoDB][api] Connection error: {}", e),
                 }
             }
@@ -180,13 +195,119 @@ fn handle_client(mut stream: TcpStream, state: Arc<ApiServerState>) {
 
     let response = match (method, path) {
         ("GET", "/health") | ("GET", "/heatlh") => {
-            HttpResponse::json("200 OK", state.health.health_payload())
+            Some(HttpResponse::json("200 OK", state.health.health_payload()))
         }
-        ("POST", "/query") => handle_query_request(&state, &headers, body_bytes),
-        _ => HttpResponse::text("404 Not Found", "Not Found"),
+        ("GET", "/time") => Some(handle_time_request()),
+        ("GET", "/setup/status") => Some(handle_setup_status()),
+        ("POST", "/setup/init") => Some(handle_setup_init(&state, &headers, body_bytes)),
+        ("POST", "/setup/complete") => Some(handle_setup_complete(&state, &headers, body_bytes)),
+        ("POST", "/query") | ("POST", "/api/query") => {
+            Some(handle_query_request(&state, &headers, body_bytes))
+        }
+        ("POST", "/2fa/setup") => Some(handle_2fa_setup(&state, &headers, body_bytes)),
+        ("GET", "/2fa/qr") => Some(handle_2fa_qr(&state, &headers)),
+        ("POST", "/2fa/verify") => Some(handle_2fa_verify(&state, &headers, body_bytes)),
+        _ => None,
     };
 
-    let _ = write_http_response(&mut stream, &response);
+    if let Some(response) = response {
+        let _ = write_http_response(&mut stream, &response);
+        return;
+    }
+
+    proxy_to_console(stream, request_bytes);
+}
+
+fn proxy_to_console(mut client_stream: TcpStream, request_bytes: Vec<u8>) {
+    match TcpStream::connect(CONSOLE_PROXY_ADDR) {
+        Ok(mut console_stream) => {
+            if let Err(err) = console_stream.write_all(&request_bytes) {
+                eprintln!(
+                    "[MirseoDB][console-proxy] Failed to write request to console server: {}",
+                    err
+                );
+                let response = HttpResponse::text(
+                    "502 Bad Gateway",
+                    "Console dev server unavailable (could not write request)",
+                );
+                let _ = write_http_response(&mut client_stream, &response);
+                return;
+            }
+
+            if let Err(err) = console_stream.flush() {
+                eprintln!(
+                    "[MirseoDB][console-proxy] Failed to flush request to console server: {}",
+                    err
+                );
+                let response = HttpResponse::text(
+                    "502 Bad Gateway",
+                    "Console dev server unavailable (flush failed)",
+                );
+                let _ = write_http_response(&mut client_stream, &response);
+                return;
+            }
+
+            let mut console_reader = match console_stream.try_clone() {
+                Ok(stream) => stream,
+                Err(err) => {
+                    eprintln!(
+                        "[MirseoDB][console-proxy] Failed to clone console stream: {}",
+                        err
+                    );
+                    let response = HttpResponse::text(
+                        "502 Bad Gateway",
+                        "Console dev server unavailable (clone failed)",
+                    );
+                    let _ = write_http_response(&mut client_stream, &response);
+                    return;
+                }
+            };
+
+            let mut client_writer = match client_stream.try_clone() {
+                Ok(stream) => stream,
+                Err(err) => {
+                    eprintln!(
+                        "[MirseoDB][console-proxy] Failed to clone client stream: {}",
+                        err
+                    );
+                    let response = HttpResponse::text(
+                        "502 Bad Gateway",
+                        "Console dev server unavailable (clone failed)",
+                    );
+                    let _ = write_http_response(&mut client_stream, &response);
+                    return;
+                }
+            };
+
+            let console_to_client = thread::spawn(move || {
+                let _ = std::io::copy(&mut console_reader, &mut client_writer);
+            });
+
+            let mut client_reader = client_stream;
+            let mut console_writer = console_stream;
+
+            if let Err(err) = std::io::copy(&mut client_reader, &mut console_writer) {
+                eprintln!(
+                    "[MirseoDB][console-proxy] Error while piping client to console: {}",
+                    err
+                );
+            }
+
+            let _ = console_writer.shutdown(Shutdown::Write);
+            let _ = console_to_client.join();
+        }
+        Err(err) => {
+            eprintln!(
+                "[MirseoDB][console-proxy] Failed to connect to console server at {}: {}",
+                CONSOLE_PROXY_ADDR, err
+            );
+            let response = HttpResponse::text(
+                "502 Bad Gateway",
+                "Console dev server unavailable (connection failed)",
+            );
+            let _ = write_http_response(&mut client_stream, &response);
+        }
+    }
 }
 
 fn handle_query_request(
@@ -243,6 +364,8 @@ fn handle_query_request(
     let QueryRequest {
         sql: mut sql_text,
         auth_token: request_token,
+        totp_token: request_totp,
+        email: request_email,
     } = request;
 
     let provided_token = extract_auth_token(headers, request_token.clone());
@@ -270,6 +393,47 @@ fn handle_query_request(
         }
     }
 
+    // Check if setup is completed first
+    let auth_config = match AuthConfig::load() {
+        Ok(config) => config,
+        Err(e) => {
+            let mut body = error_json(&format!("Auth config error: {}", e), start_time.elapsed());
+            if sanitized_applied {
+                insert_sanitized_flag(&mut body);
+            }
+            return HttpResponse::json("500 Internal Server Error", body);
+        }
+    };
+
+    if !auth_config.is_setup_completed() {
+        let mut body = error_json(
+            "Database setup not completed. Please complete initial setup at /setup/init",
+            start_time.elapsed(),
+        );
+        if sanitized_applied {
+            insert_sanitized_flag(&mut body);
+        }
+        return HttpResponse::json("503 Service Unavailable", body);
+    }
+
+    // Check email-based SQL permissions
+    if let Some(email) = request_email.as_ref() {
+        if !auth_config.check_sql_permission(email, &sql_text) {
+            let user_role = auth_config.get_user_role(email).unwrap_or("unknown");
+            let mut body = error_json(
+                &format!(
+                    "SQL permission denied for user '{}' with role '{}'",
+                    email, user_role
+                ),
+                start_time.elapsed(),
+            );
+            if sanitized_applied {
+                insert_sanitized_flag(&mut body);
+            }
+            return HttpResponse::json("403 Forbidden", body);
+        }
+    }
+
     let statement = match state.parser.parse(&sql_text) {
         Ok(stmt) => stmt,
         Err(err) => {
@@ -280,6 +444,53 @@ fn handle_query_request(
             return HttpResponse::json("400 Bad Request", body);
         }
     };
+
+    // 민감한 작업인지 확인하고 2차 인증 검사
+    if statement.requires_2fa() {
+        let user_id = "default"; // 실제 구현에서는 적절한 사용자 ID를 사용해야 함
+
+        // TOTP 토큰 확인
+        match request_totp {
+            Some(totp) if !totp.is_empty() => {
+                let two_factor_auth = match state.two_factor_auth.lock() {
+                    Ok(guard) => guard,
+                    Err(_) => {
+                        return HttpResponse::json(
+                            "500 Internal Server Error",
+                            error_json("2FA system error", start_time.elapsed()),
+                        );
+                    }
+                };
+
+                if !two_factor_auth.verify_token(user_id, &totp) {
+                    let mut body = error_json(
+                        &format!(
+                            "2FA required for {} operation. Invalid or expired TOTP token.",
+                            statement.get_operation_name()
+                        ),
+                        start_time.elapsed(),
+                    );
+                    if sanitized_applied {
+                        insert_sanitized_flag(&mut body);
+                    }
+                    insert_2fa_required_flag(&mut body);
+                    return HttpResponse::json("403 Forbidden", body);
+                }
+            }
+            _ => {
+                let mut body = error_json(
+                    &format!("2FA required for {} operation. Please provide 'authtoken' field with your TOTP code.", 
+                            statement.get_operation_name()),
+                    start_time.elapsed(),
+                );
+                if sanitized_applied {
+                    insert_sanitized_flag(&mut body);
+                }
+                insert_2fa_required_flag(&mut body);
+                return HttpResponse::json("403 Forbidden", body);
+            }
+        }
+    }
 
     let execution_result = {
         let mut db = match state.database.lock() {
@@ -358,6 +569,8 @@ fn parse_query_payload(body: &[u8], allow_raw_sql: bool) -> Result<QueryRequest,
         return Ok(QueryRequest {
             sql: text.to_string(),
             auth_token: None,
+            totp_token: None,
+            email: None,
         });
     }
 
@@ -372,7 +585,20 @@ fn parse_query_request_json(text: &str) -> Result<QueryRequest, String> {
         .or_else(|| extract_json_string_field(text, "token"))
         .or_else(|| extract_json_string_field(text, "auth"));
 
-    Ok(QueryRequest { sql, auth_token })
+    let totp_token = extract_json_string_field(text, "authtoken")
+        .or_else(|| extract_json_string_field(text, "totp"))
+        .or_else(|| extract_json_string_field(text, "totp_token"));
+
+    let email = extract_json_string_field(text, "email")
+        .or_else(|| extract_json_string_field(text, "user_email"))
+        .or_else(|| extract_json_string_field(text, "user"));
+
+    Ok(QueryRequest {
+        sql,
+        auth_token,
+        totp_token,
+        email,
+    })
 }
 
 fn extract_json_string_field(text: &str, field: &str) -> Option<String> {
@@ -542,10 +768,222 @@ fn replace_case_insensitive(input: &str, pattern: &str, replacement: &str) -> (S
     (result, true)
 }
 
-fn insert_sanitized_flag(body: &mut String) {
+fn insert_2fa_required_flag(body: &mut String) {
     if let Some(pos) = body.rfind('}') {
-        body.insert_str(pos, ",\"sanitized\":true");
+        body.insert_str(pos, ",\"requires_2fa\":true");
     }
+}
+
+fn handle_2fa_setup(
+    state: &Arc<ApiServerState>,
+    headers: &HashMap<String, String>,
+    _body: &[u8],
+) -> HttpResponse {
+    let start_time = Instant::now();
+
+    // Basic API token 인증 확인
+    if let Some(expected) = state.auth_token.as_ref() {
+        let provided_token = extract_auth_token(headers, None);
+        match provided_token {
+            Some(ref token) if token == expected => {}
+            _ => {
+                return HttpResponse::json(
+                    "401 Unauthorized",
+                    error_json("Invalid or missing auth token", start_time.elapsed()),
+                );
+            }
+        }
+    }
+
+    let user_id = "default"; // 실제 구현에서는 적절한 사용자 ID를 사용해야 함
+
+    let mut two_factor_auth = match state.two_factor_auth.lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            return HttpResponse::json(
+                "500 Internal Server Error",
+                error_json("2FA system error", start_time.elapsed()),
+            );
+        }
+    };
+
+    match two_factor_auth.generate_secret_for_user(user_id) {
+        Ok(secret) => {
+            let mut body = String::from("{");
+            body.push_str("\"status\":\"ok\"");
+            body.push_str(",\"message\":\"2FA setup initiated\"");
+            body.push_str(",\"secret\":\"");
+            body.push_str(&escape_json_string(&secret));
+            body.push_str("\"");
+            body.push_str(",\"user_id\":\"");
+            body.push_str(&escape_json_string(user_id));
+            body.push_str("\"");
+            append_execution_time(&mut body, start_time.elapsed());
+            body.push('}');
+
+            HttpResponse::json("200 OK", body)
+        }
+        Err(err) => HttpResponse::json(
+            "500 Internal Server Error",
+            error_json(
+                &format!("Failed to setup 2FA: {}", err),
+                start_time.elapsed(),
+            ),
+        ),
+    }
+}
+
+fn handle_2fa_qr(state: &Arc<ApiServerState>, headers: &HashMap<String, String>) -> HttpResponse {
+    let start_time = Instant::now();
+
+    // Basic API token 인증 확인
+    if let Some(expected) = state.auth_token.as_ref() {
+        let provided_token = extract_auth_token(headers, None);
+        match provided_token {
+            Some(ref token) if token == expected => {}
+            _ => {
+                return HttpResponse::json(
+                    "401 Unauthorized",
+                    error_json("Invalid or missing auth token", start_time.elapsed()),
+                );
+            }
+        }
+    }
+
+    let user_id = "default"; // 실제 구현에서는 적절한 사용자 ID를 사용해야 함
+
+    let two_factor_auth = match state.two_factor_auth.lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            return HttpResponse::json(
+                "500 Internal Server Error",
+                error_json("2FA system error", start_time.elapsed()),
+            );
+        }
+    };
+
+    match two_factor_auth.generate_qr_code(user_id, "MirseoDB") {
+        Ok(qr_ascii) => {
+            let secret = two_factor_auth.get_setup_info(user_id).unwrap_or_default();
+
+            let mut body = String::from("{");
+            body.push_str("\"status\":\"ok\"");
+            body.push_str(",\"qr_ascii\":\"");
+            body.push_str(&escape_json_string(&qr_ascii));
+            body.push_str("\"");
+            body.push_str(",\"secret\":\"");
+            body.push_str(&escape_json_string(&secret));
+            body.push_str("\"");
+            body.push_str(",\"instructions\":\"Install Google Authenticator or similar TOTP app and scan the QR code or manually enter the secret key.\"");
+            append_execution_time(&mut body, start_time.elapsed());
+            body.push('}');
+
+            HttpResponse::json("200 OK", body)
+        }
+        Err(err) => HttpResponse::json(
+            "400 Bad Request",
+            error_json(
+                &format!("2FA not setup for user: {}", err),
+                start_time.elapsed(),
+            ),
+        ),
+    }
+}
+
+fn handle_2fa_verify(
+    state: &Arc<ApiServerState>,
+    headers: &HashMap<String, String>,
+    body: &[u8],
+) -> HttpResponse {
+    let start_time = Instant::now();
+
+    // Basic API token 인증 확인
+    if let Some(expected) = state.auth_token.as_ref() {
+        let provided_token = extract_auth_token(headers, None);
+        match provided_token {
+            Some(ref token) if token == expected => {}
+            _ => {
+                return HttpResponse::json(
+                    "401 Unauthorized",
+                    error_json("Invalid or missing auth token", start_time.elapsed()),
+                );
+            }
+        }
+    }
+
+    if body.is_empty() {
+        return HttpResponse::json(
+            "400 Bad Request",
+            error_json("Request body cannot be empty", start_time.elapsed()),
+        );
+    }
+
+    let text = match std::str::from_utf8(body) {
+        Ok(t) => t.trim(),
+        Err(_) => {
+            return HttpResponse::json(
+                "400 Bad Request",
+                error_json("Request body must be valid UTF-8", start_time.elapsed()),
+            );
+        }
+    };
+
+    let totp_token = if text.starts_with('{') && text.ends_with('}') {
+        // JSON format
+        extract_json_string_field(text, "totp_token")
+            .or_else(|| extract_json_string_field(text, "token"))
+            .or_else(|| extract_json_string_field(text, "code"))
+    } else {
+        // Plain text token
+        Some(text.to_string())
+    };
+
+    let totp_token = match totp_token {
+        Some(token) if !token.is_empty() => token,
+        _ => {
+            return HttpResponse::json(
+                "400 Bad Request",
+                error_json("TOTP token is required", start_time.elapsed()),
+            );
+        }
+    };
+
+    let user_id = "default"; // 실제 구현에서는 적절한 사용자 ID를 사용해야 함
+
+    let two_factor_auth = match state.two_factor_auth.lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            return HttpResponse::json(
+                "500 Internal Server Error",
+                error_json("2FA system error", start_time.elapsed()),
+            );
+        }
+    };
+
+    let is_valid = two_factor_auth.verify_token(user_id, &totp_token);
+
+    let mut body = String::from("{");
+    body.push_str("\"status\":\"");
+    body.push_str(if is_valid { "ok" } else { "error" });
+    body.push_str("\"");
+    body.push_str(",\"valid\":");
+    body.push_str(if is_valid { "true" } else { "false" });
+    body.push_str(",\"message\":\"");
+    body.push_str(if is_valid {
+        "TOTP token is valid"
+    } else {
+        "Invalid or expired TOTP token"
+    });
+    body.push_str("\"");
+    append_execution_time(&mut body, start_time.elapsed());
+    body.push('}');
+
+    let status = if is_valid {
+        "200 OK"
+    } else {
+        "400 Bad Request"
+    };
+    HttpResponse::json(status, body)
 }
 
 fn append_execution_time(body: &mut String, elapsed: Duration) {
@@ -846,6 +1284,8 @@ fn handle_forwarded_query_request(
     let QueryRequest {
         sql: mut sql_text,
         auth_token: request_token,
+        totp_token: _request_totp, // 포워드 모드에서는 2FA 검사하지 않음
+        email: request_email,
     } = request;
 
     let provided_token = extract_auth_token(headers, request_token.clone());
@@ -998,4 +1438,297 @@ fn error_json_with_mode(message: &str, elapsed: Duration, forward_mode: bool) ->
     append_execution_time(&mut body, elapsed);
     body.push('}');
     body
+}
+
+fn insert_sanitized_flag(body: &mut String) {
+    if let Some(pos) = body.rfind('}') {
+        body.insert_str(pos, ",\"sanitized\":true");
+    }
+}
+
+fn handle_setup_status() -> HttpResponse {
+    let auth_config = match AuthConfig::load() {
+        Ok(config) => config,
+        Err(e) => {
+            return HttpResponse::json(
+                "500 Internal Server Error",
+                format!("{{\"error\":\"Failed to load auth config: {}\"}}", e),
+            );
+        }
+    };
+
+    let mut body = String::from("{");
+    body.push_str("\"setup_completed\":");
+    body.push_str(if auth_config.is_setup_completed() { "true" } else { "false" });
+
+    if let Some(admin_email) = &auth_config.admin_email {
+        body.push_str(",\"admin_email\":\"");
+        body.push_str(&escape_json_string(admin_email));
+        body.push_str("\"");
+    }
+
+    body.push_str(",\"user_count\":");
+    body.push_str(&auth_config.emails.len().to_string());
+    body.push('}');
+
+    HttpResponse::json("200 OK", body)
+}
+
+fn handle_setup_init(
+    state: &Arc<ApiServerState>,
+    _headers: &HashMap<String, String>,
+    body: &[u8],
+) -> HttpResponse {
+    let start_time = Instant::now();
+
+    if body.is_empty() {
+        return HttpResponse::json(
+            "400 Bad Request",
+            error_json("Request body cannot be empty", start_time.elapsed()),
+        );
+    }
+
+    let text = match std::str::from_utf8(body) {
+        Ok(t) => t.trim(),
+        Err(_) => {
+            return HttpResponse::json(
+                "400 Bad Request",
+                error_json("Request body must be valid UTF-8", start_time.elapsed()),
+            );
+        }
+    };
+
+    let admin_email = if text.starts_with('{') && text.ends_with('}') {
+        extract_json_string_field(text, "admin_email")
+            .or_else(|| extract_json_string_field(text, "email"))
+    } else {
+        Some(text.to_string())
+    };
+
+    let admin_email = match admin_email {
+        Some(email) if !email.is_empty() && email.contains('@') => email,
+        _ => {
+            return HttpResponse::json(
+                "400 Bad Request",
+                error_json("Valid admin email is required", start_time.elapsed()),
+            );
+        }
+    };
+
+    let auth_config = match AuthConfig::load() {
+        Ok(config) => config,
+        Err(e) => {
+            return HttpResponse::json(
+                "500 Internal Server Error",
+                error_json(&format!("Auth config error: {}", e), start_time.elapsed()),
+            );
+        }
+    };
+
+    if auth_config.is_setup_completed() {
+        return HttpResponse::json(
+            "400 Bad Request",
+            error_json("Setup already completed", start_time.elapsed()),
+        );
+    }
+
+    // 관리자용 2FA 설정 시작
+    let user_id = &admin_email; // 이메일을 user_id로 사용
+
+    let mut two_factor_auth = match state.two_factor_auth.lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            return HttpResponse::json(
+                "500 Internal Server Error",
+                error_json("2FA system error", start_time.elapsed()),
+            );
+        }
+    };
+
+    match two_factor_auth.generate_secret_for_user(user_id) {
+        Ok(secret) => {
+            let qr_result = two_factor_auth.generate_qr_code(user_id, "MirseoDB Admin Setup");
+
+            let mut response_body = String::from("{");
+            response_body.push_str("\"status\":\"ok\"");
+            response_body.push_str(",\"message\":\"Admin setup initiated\"");
+            response_body.push_str(",\"admin_email\":\"");
+            response_body.push_str(&escape_json_string(&admin_email));
+            response_body.push_str("\"");
+            response_body.push_str(",\"secret\":\"");
+            response_body.push_str(&escape_json_string(&secret));
+            response_body.push_str("\"");
+
+            if let Ok(qr_ascii) = qr_result {
+                response_body.push_str(",\"qr_code\":\"");
+                response_body.push_str(&escape_json_string(&qr_ascii));
+                response_body.push_str("\"");
+            }
+
+            response_body.push_str(",\"setup_2fa\":true");
+            response_body.push_str(",\"instructions\":\"Please setup 2FA using the secret key or QR code, then call /setup/complete with your TOTP token. You can also skip 2FA setup by calling /setup/complete with skip_2fa=true.\"");
+            append_execution_time(&mut response_body, start_time.elapsed());
+            response_body.push('}');
+
+            HttpResponse::json("200 OK", response_body)
+        }
+        Err(err) => HttpResponse::json(
+            "500 Internal Server Error",
+            error_json(&format!("Failed to setup 2FA: {}", err), start_time.elapsed()),
+        ),
+    }
+}
+
+fn handle_setup_complete(
+    state: &Arc<ApiServerState>,
+    _headers: &HashMap<String, String>,
+    body: &[u8],
+) -> HttpResponse {
+    let start_time = Instant::now();
+
+    if body.is_empty() {
+        return HttpResponse::json(
+            "400 Bad Request",
+            error_json("Request body cannot be empty", start_time.elapsed()),
+        );
+    }
+
+    let text = match std::str::from_utf8(body) {
+        Ok(t) => t.trim(),
+        Err(_) => {
+            return HttpResponse::json(
+                "400 Bad Request",
+                error_json("Request body must be valid UTF-8", start_time.elapsed()),
+            );
+        }
+    };
+
+    if !text.starts_with('{') || !text.ends_with('}') {
+        return HttpResponse::json(
+            "400 Bad Request",
+            error_json("Request body must be JSON", start_time.elapsed()),
+        );
+    }
+
+    let admin_email = extract_json_string_field(text, "admin_email")
+        .or_else(|| extract_json_string_field(text, "email"));
+
+    let totp_token = extract_json_string_field(text, "totp_token")
+        .or_else(|| extract_json_string_field(text, "token"));
+
+    let skip_2fa = extract_json_string_field(text, "skip_2fa")
+        .map(|s| s.to_lowercase() == "true")
+        .unwrap_or(false);
+
+    let admin_email = match admin_email {
+        Some(email) if !email.is_empty() && email.contains('@') => email,
+        _ => {
+            return HttpResponse::json(
+                "400 Bad Request",
+                error_json("Valid admin email is required", start_time.elapsed()),
+            );
+        }
+    };
+
+    let mut auth_config = match AuthConfig::load() {
+        Ok(config) => config,
+        Err(e) => {
+            return HttpResponse::json(
+                "500 Internal Server Error",
+                error_json(&format!("Auth config error: {}", e), start_time.elapsed()),
+            );
+        }
+    };
+
+    if auth_config.is_setup_completed() {
+        return HttpResponse::json(
+            "400 Bad Request",
+            error_json("Setup already completed", start_time.elapsed()),
+        );
+    }
+
+    // 2FA 검증 (skip하지 않는 경우에만)
+    if !skip_2fa {
+        match totp_token {
+            Some(token) if !token.is_empty() => {
+                let two_factor_auth = match state.two_factor_auth.lock() {
+                    Ok(guard) => guard,
+                    Err(_) => {
+                        return HttpResponse::json(
+                            "500 Internal Server Error",
+                            error_json("2FA system error", start_time.elapsed()),
+                        );
+                    }
+                };
+
+                if !two_factor_auth.verify_token(&admin_email, &token) {
+                    return HttpResponse::json(
+                        "400 Bad Request",
+                        error_json("Invalid or expired TOTP token", start_time.elapsed()),
+                    );
+                }
+            }
+            _ => {
+                return HttpResponse::json(
+                    "400 Bad Request",
+                    error_json("TOTP token required (or set skip_2fa=true)", start_time.elapsed()),
+                );
+            }
+        }
+    }
+
+    // 설정 완료
+    if let Err(e) = auth_config.complete_setup(admin_email.clone()) {
+        return HttpResponse::json(
+            "500 Internal Server Error",
+            error_json(&format!("Failed to complete setup: {}", e), start_time.elapsed()),
+        );
+    }
+
+    let mut response_body = String::from("{");
+    response_body.push_str("\"status\":\"ok\"");
+    response_body.push_str(",\"message\":\"Database setup completed successfully\"");
+    response_body.push_str(",\"admin_email\":\"");
+    response_body.push_str(&escape_json_string(&admin_email));
+    response_body.push_str("\"");
+    response_body.push_str(",\"2fa_enabled\":");
+    response_body.push_str(if skip_2fa { "false" } else { "true" });
+    response_body.push_str(",\"setup_completed\":true");
+    append_execution_time(&mut response_body, start_time.elapsed());
+    response_body.push('}');
+
+    HttpResponse::json("200 OK", response_body)
+}
+
+fn handle_time_request() -> HttpResponse {
+    let now = SystemTime::now();
+    let since_epoch = now.duration_since(UNIX_EPOCH).unwrap_or_default();
+    let unix_seconds = since_epoch.as_secs();
+    let nano_offset = since_epoch.subsec_nanos();
+    let timestamp_ms = since_epoch.as_millis();
+    const NTP_UNIX_OFFSET: u64 = 2_208_988_800;
+    let ntp_timestamp = unix_seconds + NTP_UNIX_OFFSET;
+
+    let iso8601 = OffsetDateTime::from_unix_timestamp(unix_seconds as i64)
+        .ok()
+        .and_then(|dt| dt.replace_nanosecond(nano_offset).ok())
+        .and_then(|dt| dt.format(&Rfc3339).ok())
+        .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string());
+
+    let mut body = String::from("{");
+    body.push_str("\"time_server\":true");
+    body.push_str(",\"ntp_timestamp\":");
+    body.push_str(&ntp_timestamp.to_string());
+    body.push_str(",\"unix_timestamp\":");
+    body.push_str(&unix_seconds.to_string());
+    body.push_str(",\"nano_offset\":");
+    body.push_str(&nano_offset.to_string());
+    body.push_str(",\"timestamp_ms\":");
+    body.push_str(&timestamp_ms.to_string());
+    body.push_str(",\"iso8601\":\"");
+    body.push_str(&iso8601);
+    body.push_str("\"");
+    body.push('}');
+
+    HttpResponse::json("200 OK", body)
 }

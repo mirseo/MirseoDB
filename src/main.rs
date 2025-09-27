@@ -1,30 +1,117 @@
-mod smart_parser;
-mod indexing;
+mod auth;
 mod configuration;
-mod engine;
-mod server;
-mod security;
-mod legacy_parser;
-mod routing;
-mod persistence;
 mod core_types;
+mod engine;
+mod indexing;
+mod legacy_parser;
+mod persistence;
+mod routing;
+mod security;
+mod server;
+mod smart_parser;
+mod two_factor_auth;
 
-use smart_parser::AnySQL;
+use auth::AuthConfig;
 use configuration::ConfigManager;
-use engine::Database;
-use server::start_health_server;
-use routing::RouteConfig;
 use core_types::DatabaseError;
+use engine::Database;
+use routing::RouteConfig;
+use server::start_health_server;
+use smart_parser::AnySQL;
 use std::env;
-use std::sync::{Arc, Mutex};
+use std::path::Path;
+use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
+static SVELTEKIT_PROCESS: OnceLock<Arc<Mutex<Option<Child>>>> = OnceLock::new();
+
 const DEFAULT_HEALTH_PORT: u16 = 3306;
 const HEARTBEAT_INTERVAL_SECS: u64 = 60;
+const CONSOLE_DIR: &str = "console";
+
+fn register_shutdown_handler() {
+    let storage = Arc::clone(SVELTEKIT_PROCESS.get_or_init(|| Arc::new(Mutex::new(None))));
+
+    if let Err(err) = ctrlc::try_set_handler(move || {
+        if let Ok(mut guard) = storage.lock() {
+            if let Some(child) = guard.as_mut() {
+                if let Err(kill_err) = child.kill() {
+                    eprintln!(
+                        "[MirseoDB][Console] Failed to terminate SvelteKit dev server: {}",
+                        kill_err
+                    );
+                }
+            }
+        }
+
+        std::process::exit(0);
+    }) {
+        eprintln!(
+            "[MirseoDB][Console] Failed to install shutdown handler: {}",
+            err
+        );
+    }
+}
+
+fn spawn_console_server() {
+    if env::var("MIRSEODB_SKIP_CONSOLE").is_ok() {
+        println!("[MirseoDB][Console] Skipping console startup (MIRSEODB_SKIP_CONSOLE set)");
+        return;
+    }
+
+    let storage = Arc::clone(SVELTEKIT_PROCESS.get_or_init(|| Arc::new(Mutex::new(None))));
+
+    if let Ok(guard) = storage.lock() {
+        if guard.is_some() {
+            return;
+        }
+    }
+
+    let console_path = Path::new(CONSOLE_DIR);
+    if !console_path.exists() {
+        println!(
+            "[MirseoDB][Console] Console directory '{}' not found; skipping web console startup",
+            CONSOLE_DIR
+        );
+        return;
+    }
+
+    let mut command = Command::new("npm");
+    command.arg("run").arg("dev");
+    command.current_dir(console_path);
+    command.stdout(Stdio::inherit());
+    command.stderr(Stdio::inherit());
+
+    match command.spawn() {
+        Ok(child) => {
+            if let Ok(mut guard) = storage.lock() {
+                let pid = child.id();
+                *guard = Some(child);
+                println!(
+                    "[MirseoDB][Console] SvelteKit dev server started (npm run dev) [pid={}]; web console proxied at http://127.0.0.1:3306/ (dev server http://localhost:5173)",
+                    pid
+                );
+            }
+        }
+        Err(err) => {
+            eprintln!(
+                "[MirseoDB][Console] Failed to start SvelteKit dev server via 'npm run dev': {}",
+                err
+            );
+            eprintln!(
+                "[MirseoDB][Console] Ensure Node.js/npm are installed and dependencies in '{}/package.json' are set up",
+                CONSOLE_DIR
+            );
+        }
+    }
+}
 
 fn main() {
+    register_shutdown_handler();
     println!("[MirseoDB] Starting MirseoDB Server...");
+    spawn_console_server();
 
     let (database, database_name) = match initialize_database() {
         Ok(pair) => {
@@ -116,6 +203,7 @@ fn initialize_database() -> Result<(Arc<Mutex<Database>>, String), DatabaseError
     let db_name = "mirseodb".to_string();
 
     ConfigManager::ensure_exists()?;
+    AuthConfig::ensure_exists().map_err(|e| DatabaseError::IoError(e))?;
 
     println!("[MirseoDB] Loading database '{}'...", db_name);
 

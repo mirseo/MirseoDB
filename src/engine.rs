@@ -1,10 +1,10 @@
-use super::indexing::{IndexManager, IndexKey};
 use super::configuration::ConfigManager;
-use super::persistence::StorageEngine;
 use super::core_types::{
     ColumnDefinition, ComparisonOperator, DatabaseError, Row, SqlStatement, SqlValue, Table,
     WhereClause,
 };
+use super::indexing::{IndexKey, IndexManager};
+use super::persistence::StorageEngine;
 use std::collections::HashMap;
 
 pub struct Database {
@@ -54,7 +54,10 @@ impl Database {
         })?;
 
         println!("Database '{}' created at {}", name, db_file_path.display());
-        println!("Route configuration created at {}", route_cfg_path.display());
+        println!(
+            "Route configuration created at {}",
+            route_cfg_path.display()
+        );
 
         // Ensure config exists with defaults on first creation
         ConfigManager::ensure_exists()?;
@@ -185,6 +188,77 @@ impl Database {
                 } else {
                     for index in indices_to_delete.into_iter().rev() {
                         table.rows.remove(index);
+                    }
+                }
+
+                self.storage.save_tables(&self.tables)?;
+                Ok(vec![])
+            }
+            SqlStatement::DropTable { table_name } => {
+                self.tables.remove(&table_name);
+                self.storage.save_tables(&self.tables)?;
+                Ok(vec![])
+            }
+            SqlStatement::DropDatabase { database_name } => {
+                // Drop database is a dangerous operation - clear all tables
+                self.tables.clear();
+                self.storage.save_tables(&self.tables)?;
+                Ok(vec![])
+            }
+            SqlStatement::AlterTable { table_name, action } => {
+                use super::core_types::AlterAction;
+
+                let table = self
+                    .tables
+                    .get_mut(&table_name)
+                    .ok_or_else(|| DatabaseError::TableNotFound(table_name.clone()))?;
+
+                match action {
+                    AlterAction::AddColumn { column } => {
+                        // Check if column already exists
+                        if table.columns.iter().any(|c| c.name == column.name) {
+                            return Err(DatabaseError::ParseError(format!(
+                                "Column '{}' already exists",
+                                column.name
+                            )));
+                        }
+
+                        // Add column definition
+                        table.columns.push(column.clone());
+
+                        // Add default value to all existing rows
+                        let default_value = match column.data_type {
+                            super::core_types::DataType::Integer => SqlValue::Integer(0),
+                            super::core_types::DataType::Float => SqlValue::Float(0.0),
+                            super::core_types::DataType::Text => SqlValue::Text("".to_string()),
+                            super::core_types::DataType::Boolean => SqlValue::Boolean(false),
+                        };
+
+                        for row in &mut table.rows {
+                            row.columns
+                                .insert(column.name.clone(), default_value.clone());
+                        }
+                    }
+                    AlterAction::DropColumn { column_name } => {
+                        // Remove column definition
+                        table.columns.retain(|c| c.name != *column_name);
+
+                        // Remove column data from all rows
+                        for row in &mut table.rows {
+                            row.columns.remove(&column_name);
+                        }
+                    }
+                    AlterAction::ModifyColumn { column } => {
+                        // Find and update column definition
+                        if let Some(existing_column) =
+                            table.columns.iter_mut().find(|c| c.name == column.name)
+                        {
+                            existing_column.data_type = column.data_type.clone();
+                            existing_column.nullable = column.nullable;
+                            existing_column.primary_key = column.primary_key;
+                        } else {
+                            return Err(DatabaseError::ColumnNotFound(column.name.clone()));
+                        }
                     }
                 }
 
@@ -453,10 +527,7 @@ impl Database {
         }
     }
 
-    fn index_key_to_sql_value(
-        &self,
-        key: &IndexKey,
-    ) -> Result<SqlValue, DatabaseError> {
+    fn index_key_to_sql_value(&self, key: &IndexKey) -> Result<SqlValue, DatabaseError> {
         match key {
             IndexKey::Integer(i) => Ok(SqlValue::Integer(*i)),
             IndexKey::Float(f) => Ok(SqlValue::Float(f.value())),

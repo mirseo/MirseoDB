@@ -1,0 +1,12 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "types": ["svelte"]
+  },
+  "include": [
+    "src/**/*",
+    "src/node_modules/@types/**/*",
+    "svelte.config.js",
+    "vite.config.ts"
+  ]
+}

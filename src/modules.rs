@@ -2,6 +2,7 @@ pub mod anysql_parser;
 pub mod btree;
 pub mod database;
 pub mod health_server;
+pub mod identifier;
 pub mod parser;
 pub mod storage;
 pub mod types;

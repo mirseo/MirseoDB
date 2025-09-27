@@ -1,3 +1,4 @@
+use super::identifier::{normalize_identifier, normalize_table_name};
 use super::types::{
     ColumnDefinition, ComparisonOperator, DataType, DatabaseError, SqlStatement, SqlValue,
     WhereClause,
@@ -8,13 +9,6 @@ use std::collections::HashMap;
 pub struct AnySQL {
     hyperthinking_enabled: bool,
     keyword_patterns: KeywordPatterns,
-}
-
-fn normalize_identifier(token: &str) -> String {
-    token
-        .trim()
-        .trim_matches(|ch| matches!(ch, '[' | ']' | '`' | '"' | '\'' | ';'))
-        .to_string()
 }
 
 #[derive(Debug, Clone)]
@@ -239,7 +233,7 @@ impl AnySQL {
             ));
         }
 
-        let database_name = normalize_identifier(tokens[2]);
+        let database_name = normalize_table_name(tokens[2]);
         Ok(SqlStatement::CreateDatabase { database_name })
     }
 
@@ -252,7 +246,7 @@ impl AnySQL {
             ));
         }
 
-        let table_name = normalize_identifier(tokens[2]);
+        let table_name = normalize_table_name(tokens[2]);
 
         if tokens.len() == 3 || !sql.contains('(') {
             return Ok(SqlStatement::CreateTable {
@@ -417,7 +411,8 @@ impl AnySQL {
             ));
         }
 
-        let table_name = normalize_identifier(tokens[0]);
+        let raw_table_token = tokens[0];
+        let table_name = normalize_table_name(raw_table_token);
 
         // Find VALUES clause
         let values_pos = sql_upper
@@ -425,7 +420,10 @@ impl AnySQL {
             .ok_or_else(|| DatabaseError::ParseError("Missing VALUES clause".to_string()))?;
 
         // Extract columns if specified
-        let table_end = sql.find(&table_name).unwrap() + table_name.len();
+        let raw_table_pos = sql
+            .find(raw_table_token)
+            .ok_or_else(|| DatabaseError::ParseError("Unable to locate table name".to_string()))?;
+        let table_end = raw_table_pos + raw_table_token.len();
         let columns_part = &sql[table_end..values_pos];
 
         let columns = if let Some(start) = columns_part.find('(') {
@@ -487,7 +485,7 @@ impl AnySQL {
             .map(|s| normalize_identifier(s))
             .collect();
 
-        let table_name = normalize_identifier(tokens[from_pos + 1]);
+        let table_name = normalize_table_name(tokens[from_pos + 1]);
 
         let where_clause = if let Some(where_pos) = tokens
             .iter()
@@ -514,7 +512,7 @@ impl AnySQL {
             ));
         }
 
-        let table_name = normalize_identifier(tokens[1]);
+        let table_name = normalize_table_name(tokens[1]);
 
         let set_pos = tokens
             .iter()
@@ -564,7 +562,7 @@ impl AnySQL {
             ));
         }
 
-        let table_name = normalize_identifier(tokens[2]);
+        let table_name = normalize_table_name(tokens[2]);
 
         let where_clause = if let Some(where_pos) = tokens
             .iter()

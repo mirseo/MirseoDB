@@ -1,6 +1,20 @@
-mod modules;
+mod anysql_parser;
+mod btree;
+mod config;
+mod database;
+mod health_server;
+mod identifier;
+mod parser;
+mod route;
+mod storage;
+mod types;
 
-use modules::{start_health_server, AnySQL, ConfigManager, Database, RouteConfig};
+use anysql_parser::AnySQL;
+use config::ConfigManager;
+use database::Database;
+use health_server::start_health_server;
+use route::RouteConfig;
+use types::DatabaseError;
 use std::env;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -98,7 +112,7 @@ fn main() {
     }
 }
 
-fn initialize_database() -> Result<(Arc<Mutex<Database>>, String), modules::DatabaseError> {
+fn initialize_database() -> Result<(Arc<Mutex<Database>>, String), DatabaseError> {
     let db_name = "mirseodb".to_string();
 
     ConfigManager::ensure_exists()?;

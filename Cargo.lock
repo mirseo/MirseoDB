@@ -3,5 +3,5 @@
 version = 4
 
 [[package]]
-name = "mdb"
+name = "mirseodb"
 version = "0.1.0"

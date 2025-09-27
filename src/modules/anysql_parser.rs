@@ -10,6 +10,13 @@ pub struct AnySQL {
     keyword_patterns: KeywordPatterns,
 }
 
+fn normalize_identifier(token: &str) -> String {
+    token
+        .trim()
+        .trim_matches(|ch| matches!(ch, '[' | ']' | '`' | '"' | '\'' | ';'))
+        .to_string()
+}
+
 #[derive(Debug, Clone)]
 struct KeywordPatterns {
     mssql_keywords: Vec<&'static str>,
@@ -232,25 +239,20 @@ impl AnySQL {
             ));
         }
 
-        let database_name = tokens[2]
-            .trim_matches(&['[', ']', '`', '"'][..])
-            .to_string();
+        let database_name = normalize_identifier(tokens[2]);
         Ok(SqlStatement::CreateDatabase { database_name })
     }
 
     fn parse_create_table_anysql(&self, sql: &str) -> Result<SqlStatement, DatabaseError> {
-        let sql_upper = sql.to_uppercase();
-        let tokens: Vec<&str> = sql_upper.split_whitespace().collect();
+        let tokens: Vec<&str> = sql.split_whitespace().collect();
 
-        if tokens.len() < 3 || tokens[1] != "TABLE" {
+        if tokens.len() < 3 || !tokens[1].eq_ignore_ascii_case("TABLE") {
             return Err(DatabaseError::ParseError(
                 "Invalid CREATE TABLE syntax".to_string(),
             ));
         }
 
-        let table_name = tokens[2]
-            .trim_matches(&['[', ']', '`', '"'][..])
-            .to_string();
+        let table_name = normalize_identifier(tokens[2]);
 
         if tokens.len() == 3 || !sql.contains('(') {
             return Ok(SqlStatement::CreateTable {
@@ -285,9 +287,7 @@ impl AnySQL {
                 continue;
             }
 
-            let column_name = column_tokens[0]
-                .trim_matches(&['[', ']', '`', '"'][..])
-                .to_string();
+            let column_name = normalize_identifier(column_tokens[0]);
             let data_type = self.parse_data_type_anysql(column_tokens[1])?;
 
             let mut nullable = true;
@@ -417,9 +417,7 @@ impl AnySQL {
             ));
         }
 
-        let table_name = tokens[0]
-            .trim_matches(&['[', ']', '`', '"'][..])
-            .to_string();
+        let table_name = normalize_identifier(tokens[0]);
 
         // Find VALUES clause
         let values_pos = sql_upper
@@ -435,7 +433,7 @@ impl AnySQL {
                 let columns_str = &columns_part[start + 1..end];
                 columns_str
                     .split(',')
-                    .map(|s| s.trim().trim_matches(&['[', ']', '`', '"'][..]).to_string())
+                    .map(|s| normalize_identifier(s))
                     .collect()
             } else {
                 vec!["*".to_string()]
@@ -486,12 +484,10 @@ impl AnySQL {
         let columns: Vec<String> = tokens[1..from_pos]
             .iter()
             .flat_map(|s| s.split(','))
-            .map(|s| s.trim().trim_matches(&['[', ']', '`', '"'][..]).to_string())
+            .map(|s| normalize_identifier(s))
             .collect();
 
-        let table_name = tokens[from_pos + 1]
-            .trim_matches(&['[', ']', '`', '"'][..])
-            .to_string();
+        let table_name = normalize_identifier(tokens[from_pos + 1]);
 
         let where_clause = if let Some(where_pos) = tokens
             .iter()
@@ -518,9 +514,7 @@ impl AnySQL {
             ));
         }
 
-        let table_name = tokens[1]
-            .trim_matches(&['[', ']', '`', '"'][..])
-            .to_string();
+        let table_name = normalize_identifier(tokens[1]);
 
         let set_pos = tokens
             .iter()
@@ -543,10 +537,7 @@ impl AnySQL {
                 return Err(DatabaseError::ParseError("Invalid SET clause".to_string()));
             }
 
-            let column_name = parts[0]
-                .trim()
-                .trim_matches(&['[', ']', '`', '"'][..])
-                .to_string();
+            let column_name = normalize_identifier(parts[0]);
             let value = self.parse_value_anysql(parts[1].trim())?;
             set_clauses.push((column_name, value));
         }
@@ -573,9 +564,7 @@ impl AnySQL {
             ));
         }
 
-        let table_name = tokens[2]
-            .trim_matches(&['[', ']', '`', '"'][..])
-            .to_string();
+        let table_name = normalize_identifier(tokens[2]);
 
         let where_clause = if let Some(where_pos) = tokens
             .iter()
@@ -599,9 +588,7 @@ impl AnySQL {
             ));
         }
 
-        let column = tokens[0]
-            .trim_matches(&['[', ']', '`', '"'][..])
-            .to_string();
+        let column = normalize_identifier(tokens[0]);
         let operator = self.parse_comparison_operator(tokens[1])?;
         let value = self.parse_value_anysql(tokens[2])?;
 

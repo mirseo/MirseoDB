@@ -1,21 +1,49 @@
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::Arc;
 use std::thread;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 const MAX_PORT: u16 = 65535;
+
+struct HealthServerState {
+    start_time: Instant,
+    version: &'static str,
+    last_checkpoint_ms: u128,
+}
+
+impl HealthServerState {
+    fn new() -> Self {
+        let start_time = Instant::now();
+        let last_checkpoint_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+
+        Self {
+            start_time,
+            version: env!("CARGO_PKG_VERSION"),
+            last_checkpoint_ms,
+        }
+    }
+}
 
 pub fn start_health_server(start_port: u16) -> std::io::Result<u16> {
     let listener = bind_available_port(start_port)?;
     let port = listener.local_addr()?.port();
+    let state = Arc::new(HealthServerState::new());
 
-    thread::spawn(move || {
-        for stream in listener.incoming() {
-            match stream {
-                Ok(stream) => {
-                    handle_client(stream);
-                }
-                Err(e) => {
-                    eprintln!("[MirseoDB][health] Connection error: {}", e);
+    thread::spawn({
+        let state = Arc::clone(&state);
+        move || {
+            for stream in listener.incoming() {
+                match stream {
+                    Ok(stream) => {
+                        handle_client(stream, Arc::clone(&state));
+                    }
+                    Err(e) => {
+                        eprintln!("[MirseoDB][health] Connection error: {}", e);
+                    }
                 }
             }
         }
@@ -44,7 +72,7 @@ fn bind_available_port(start_port: u16) -> std::io::Result<TcpListener> {
     }
 }
 
-fn handle_client(mut stream: TcpStream) {
+fn handle_client(mut stream: TcpStream, state: Arc<HealthServerState>) {
     let mut buffer = [0u8; 1024];
 
     if let Ok(bytes_read) = stream.read(&mut buffer) {
@@ -63,11 +91,19 @@ fn handle_client(mut stream: TcpStream) {
             if method.eq_ignore_ascii_case("GET")
                 && (path == "/health" || path == "/heatlh")
             {
+                let uptime_ms = state.start_time.elapsed().as_millis();
+                let body = format!(
+                    "{{\"status\":\"200 OK\",\"status_code\":200,\"uptime_ms\":{},\"version\":\"{}\",\"transactions_active\":0,\"wal_lsn\":\"0/0\",\"last_checkpoint\":{}}}",
+                    uptime_ms,
+                    state.version,
+                    state.last_checkpoint_ms
+                );
+
                 write_response(
                     &mut stream,
                     "200 OK",
                     "application/json",
-                    "{\"status\":\"200 OK\"}",
+                    &body,
                 );
                 return;
             }

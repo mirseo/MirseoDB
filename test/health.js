@@ -23,7 +23,21 @@ function runHealthCheck(port, path) {
 
     res.on('end', () => {
       console.log(`[health.js] ${res.statusCode} ${res.statusMessage}`);
-      if (body.length > 0) {
+      if (body.length === 0) {
+        return;
+      }
+
+      const contentType = res.headers['content-type'] || '';
+
+      if (contentType.includes('application/json')) {
+        try {
+          const payload = JSON.parse(body);
+          console.log('[health.js] payload:', payload);
+        } catch (err) {
+          console.error(`[health.js] Failed to parse JSON: ${err.message}`);
+          console.log(`[health.js] Raw body: ${body}`);
+        }
+      } else {
         console.log(`[health.js] Body: ${body}`);
       }
     });

@@ -1,4 +1,7 @@
-use super::types::{SqlStatement, ColumnDefinition, DataType, SqlValue, WhereClause, ComparisonOperator, DatabaseError};
+use super::types::{
+    ColumnDefinition, ComparisonOperator, DataType, DatabaseError, SqlStatement, SqlValue,
+    WhereClause,
+};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
@@ -19,22 +22,66 @@ impl KeywordPatterns {
     fn new() -> Self {
         Self {
             mssql_keywords: vec![
-                "NVARCHAR", "NTEXT", "NCHAR", "MONEY", "SMALLMONEY", "IDENTITY",
-                "UNIQUEIDENTIFIER", "DATETIME2", "DATETIMEOFFSET", "HIERARCHYID",
-                "[", "]", "WITH", "NOLOCK", "READUNCOMMITTED"
+                "NVARCHAR",
+                "NTEXT",
+                "NCHAR",
+                "MONEY",
+                "SMALLMONEY",
+                "IDENTITY",
+                "UNIQUEIDENTIFIER",
+                "DATETIME2",
+                "DATETIMEOFFSET",
+                "HIERARCHYID",
+                "[",
+                "]",
+                "WITH",
+                "NOLOCK",
+                "READUNCOMMITTED",
             ],
             mysql_keywords: vec![
-                "AUTO_INCREMENT", "LONGTEXT", "MEDIUMTEXT", "TINYTEXT", "TINYINT",
-                "MEDIUMINT", "BIGINT", "UNSIGNED", "ZEROFILL", "`", "ENGINE",
-                "CHARSET", "COLLATE", "ON", "UPDATE", "CASCADE"
+                "AUTO_INCREMENT",
+                "LONGTEXT",
+                "MEDIUMTEXT",
+                "TINYTEXT",
+                "TINYINT",
+                "MEDIUMINT",
+                "BIGINT",
+                "UNSIGNED",
+                "ZEROFILL",
+                "`",
+                "ENGINE",
+                "CHARSET",
+                "COLLATE",
+                "ON",
+                "UPDATE",
+                "CASCADE",
             ],
             oracle_keywords: vec![
-                "VARCHAR2", "NVARCHAR2", "CLOB", "NCLOB", "NUMBER", "SEQUENCE",
-                "NEXTVAL", "CURRVAL", "ROWNUM", "ROWID", "DUAL", "SYSDATE"
+                "VARCHAR2",
+                "NVARCHAR2",
+                "CLOB",
+                "NCLOB",
+                "NUMBER",
+                "SEQUENCE",
+                "NEXTVAL",
+                "CURRVAL",
+                "ROWNUM",
+                "ROWID",
+                "DUAL",
+                "SYSDATE",
             ],
             standard_keywords: vec![
-                "VARCHAR", "INTEGER", "DECIMAL", "TIMESTAMP", "PRIMARY", "KEY",
-                "FOREIGN", "REFERENCES", "CHECK", "UNIQUE", "DEFAULT"
+                "VARCHAR",
+                "INTEGER",
+                "DECIMAL",
+                "TIMESTAMP",
+                "PRIMARY",
+                "KEY",
+                "FOREIGN",
+                "REFERENCES",
+                "CHECK",
+                "UNIQUE",
+                "DEFAULT",
             ],
         }
     }
@@ -57,8 +104,10 @@ impl AnySQL {
 
         let analysis = self.hyperthink_sql_analysis(sql)?;
 
-        println!("[HYPERTHINKING] Detected dialect: {:?}, Statement type: {:?}",
-                analysis.detected_dialect, analysis.statement_type);
+        println!(
+            "[HYPERTHINKING] Detected dialect: {:?}, Statement type: {:?}",
+            analysis.detected_dialect, analysis.statement_type
+        );
 
         match analysis.statement_type {
             StatementType::CreateDatabase => self.parse_create_database_anysql(sql),
@@ -72,7 +121,10 @@ impl AnySQL {
 
     fn hyperthink_sql_analysis(&self, sql: &str) -> Result<SQLAnalysis, DatabaseError> {
         let sql_upper = sql.to_uppercase();
-        let tokens: Vec<String> = sql_upper.split_whitespace().map(|s| s.to_string()).collect();
+        let tokens: Vec<String> = sql_upper
+            .split_whitespace()
+            .map(|s| s.to_string())
+            .collect();
 
         if tokens.is_empty() {
             return Err(DatabaseError::ParseError("No tokens found".to_string()));
@@ -85,12 +137,17 @@ impl AnySQL {
                 } else {
                     StatementType::CreateTable
                 }
-            },
+            }
             "INSERT" | "INSERT_INTO" => StatementType::Insert,
             "SELECT" => StatementType::Select,
             "UPDATE" => StatementType::Update,
             "DELETE" => StatementType::Delete,
-            _ => return Err(DatabaseError::ParseError(format!("Unknown statement type: {}", tokens[0]))),
+            _ => {
+                return Err(DatabaseError::ParseError(format!(
+                    "Unknown statement type: {}",
+                    tokens[0]
+                )))
+            }
         };
 
         let detected_dialect = self.detect_dialect(&sql_upper, &tokens);
@@ -106,21 +163,32 @@ impl AnySQL {
     fn detect_dialect(&self, sql: &str, _tokens: &[String]) -> DetectedDialect {
         let sql_upper = sql.to_uppercase();
 
-        if sql_upper.contains("VARCHAR2") || sql_upper.contains("NVARCHAR2") ||
-           sql_upper.contains("ROWNUM") || sql_upper.contains("DUAL") ||
-           sql_upper.contains("NEXTVAL") || sql_upper.contains("SYSDATE") {
+        if sql_upper.contains("VARCHAR2")
+            || sql_upper.contains("NVARCHAR2")
+            || sql_upper.contains("ROWNUM")
+            || sql_upper.contains("DUAL")
+            || sql_upper.contains("NEXTVAL")
+            || sql_upper.contains("SYSDATE")
+        {
             return DetectedDialect::Oracle;
         }
 
-        if sql_upper.contains("NVARCHAR") || sql_upper.contains("IDENTITY") ||
-           sql_upper.contains("UNIQUEIDENTIFIER") || sql_upper.contains("DATETIME2") ||
-           (sql.contains("[") && sql.contains("]")) {
+        if sql_upper.contains("NVARCHAR")
+            || sql_upper.contains("IDENTITY")
+            || sql_upper.contains("UNIQUEIDENTIFIER")
+            || sql_upper.contains("DATETIME2")
+            || (sql.contains("[") && sql.contains("]"))
+        {
             return DetectedDialect::MsSQL;
         }
 
-        if sql_upper.contains("AUTO_INCREMENT") || sql_upper.contains("LONGTEXT") ||
-           sql_upper.contains("MEDIUMTEXT") || sql_upper.contains("TINYTEXT") ||
-           sql_upper.contains("UNSIGNED") || sql.contains("`") {
+        if sql_upper.contains("AUTO_INCREMENT")
+            || sql_upper.contains("LONGTEXT")
+            || sql_upper.contains("MEDIUMTEXT")
+            || sql_upper.contains("TINYTEXT")
+            || sql_upper.contains("UNSIGNED")
+            || sql.contains("`")
+        {
             return DetectedDialect::MySQL;
         }
 
@@ -148,7 +216,8 @@ impl AnySQL {
             }
         }
 
-        dialect_scores.into_iter()
+        dialect_scores
+            .into_iter()
             .max_by_key(|(_, score)| *score)
             .map(|(dialect, _)| dialect)
             .unwrap_or(DetectedDialect::Standard)
@@ -158,10 +227,14 @@ impl AnySQL {
         let tokens: Vec<&str> = sql.trim().split_whitespace().collect();
 
         if tokens.len() < 3 {
-            return Err(DatabaseError::ParseError("Invalid CREATE DATABASE syntax".to_string()));
+            return Err(DatabaseError::ParseError(
+                "Invalid CREATE DATABASE syntax".to_string(),
+            ));
         }
 
-        let database_name = tokens[2].trim_matches(&['[', ']', '`', '"'][..]).to_string();
+        let database_name = tokens[2]
+            .trim_matches(&['[', ']', '`', '"'][..])
+            .to_string();
         Ok(SqlStatement::CreateDatabase { database_name })
     }
 
@@ -170,15 +243,19 @@ impl AnySQL {
         let tokens: Vec<&str> = sql_upper.split_whitespace().collect();
 
         if tokens.len() < 3 || tokens[1] != "TABLE" {
-            return Err(DatabaseError::ParseError("Invalid CREATE TABLE syntax".to_string()));
+            return Err(DatabaseError::ParseError(
+                "Invalid CREATE TABLE syntax".to_string(),
+            ));
         }
 
-        let table_name = tokens[2].trim_matches(&['[', ']', '`', '"'][..]).to_string();
+        let table_name = tokens[2]
+            .trim_matches(&['[', ']', '`', '"'][..])
+            .to_string();
 
         if tokens.len() == 3 || !sql.contains('(') {
             return Ok(SqlStatement::CreateTable {
                 table_name,
-                columns: Vec::new()
+                columns: Vec::new(),
             });
         }
         let start_pos = sql.find('(').unwrap();
@@ -187,10 +264,16 @@ impl AnySQL {
 
         let columns = self.parse_columns_anysql(columns_str)?;
 
-        Ok(SqlStatement::CreateTable { table_name, columns })
+        Ok(SqlStatement::CreateTable {
+            table_name,
+            columns,
+        })
     }
 
-    fn parse_columns_anysql(&self, columns_str: &str) -> Result<Vec<ColumnDefinition>, DatabaseError> {
+    fn parse_columns_anysql(
+        &self,
+        columns_str: &str,
+    ) -> Result<Vec<ColumnDefinition>, DatabaseError> {
         let mut columns = Vec::new();
 
         let column_defs = self.smart_split_columns(columns_str);
@@ -202,7 +285,9 @@ impl AnySQL {
                 continue;
             }
 
-            let column_name = column_tokens[0].trim_matches(&['[', ']', '`', '"'][..]).to_string();
+            let column_name = column_tokens[0]
+                .trim_matches(&['[', ']', '`', '"'][..])
+                .to_string();
             let data_type = self.parse_data_type_anysql(column_tokens[1])?;
 
             let mut nullable = true;
@@ -210,15 +295,21 @@ impl AnySQL {
 
             for i in 2..column_tokens.len() {
                 match column_tokens[i].to_uppercase().as_str() {
-                    "NOT" if i + 1 < column_tokens.len() && column_tokens[i + 1].to_uppercase() == "NULL" => {
+                    "NOT"
+                        if i + 1 < column_tokens.len()
+                            && column_tokens[i + 1].to_uppercase() == "NULL" =>
+                    {
                         nullable = false;
-                    },
-                    "PRIMARY" if i + 1 < column_tokens.len() && column_tokens[i + 1].to_uppercase() == "KEY" => {
+                    }
+                    "PRIMARY"
+                        if i + 1 < column_tokens.len()
+                            && column_tokens[i + 1].to_uppercase() == "KEY" =>
+                    {
                         primary_key = true;
-                    },
+                    }
                     "IDENTITY" | "AUTO_INCREMENT" => {
                         primary_key = true;
-                    },
+                    }
                     _ => {}
                 }
             }
@@ -248,13 +339,13 @@ impl AnySQL {
                 '\'' | '"' | '`' if !in_quotes => {
                     in_quotes = true;
                     quote_char = ch;
-                },
+                }
                 c if in_quotes && c == quote_char => in_quotes = false,
                 ',' if !in_quotes && paren_depth == 0 => {
                     result.push(current.trim().to_string());
                     current.clear();
                     continue;
-                },
+                }
                 _ => {}
             }
             current.push(ch);
@@ -276,11 +367,14 @@ impl AnySQL {
             "INT" | "INTEGER" | "BIGINT" | "SMALLINT" | "TINYINT" => Ok(DataType::Integer),
 
             // Float types (all dialects)
-            "FLOAT" | "DOUBLE" | "REAL" | "DECIMAL" | "NUMERIC" | "MONEY" | "SMALLMONEY" | "NUMBER" => Ok(DataType::Float),
+            "FLOAT" | "DOUBLE" | "REAL" | "DECIMAL" | "NUMERIC" | "MONEY" | "SMALLMONEY"
+            | "NUMBER" => Ok(DataType::Float),
 
             // Text types (all dialects)
-            "VARCHAR" | "TEXT" | "CHAR" | "NVARCHAR" | "STRING" | "VARCHAR2" | "NVARCHAR2" |
-            "LONGTEXT" | "MEDIUMTEXT" | "TINYTEXT" | "NTEXT" | "NCHAR" | "CLOB" | "NCLOB" => Ok(DataType::Text),
+            "VARCHAR" | "TEXT" | "CHAR" | "NVARCHAR" | "STRING" | "VARCHAR2" | "NVARCHAR2"
+            | "LONGTEXT" | "MEDIUMTEXT" | "TINYTEXT" | "NTEXT" | "NCHAR" | "CLOB" | "NCLOB" => {
+                Ok(DataType::Text)
+            }
 
             // Boolean types (all dialects)
             "BOOL" | "BOOLEAN" | "BIT" => Ok(DataType::Boolean),
@@ -309,21 +403,28 @@ impl AnySQL {
         } else if sql_upper.starts_with("INSERT") {
             6
         } else {
-            return Err(DatabaseError::ParseError("Invalid INSERT syntax".to_string()));
+            return Err(DatabaseError::ParseError(
+                "Invalid INSERT syntax".to_string(),
+            ));
         };
 
         let remaining = &sql[insert_pos..].trim();
         let tokens: Vec<&str> = remaining.split_whitespace().collect();
 
         if tokens.is_empty() {
-            return Err(DatabaseError::ParseError("Missing table name in INSERT".to_string()));
+            return Err(DatabaseError::ParseError(
+                "Missing table name in INSERT".to_string(),
+            ));
         }
 
-        let table_name = tokens[0].trim_matches(&['[', ']', '`', '"'][..]).to_string();
+        let table_name = tokens[0]
+            .trim_matches(&['[', ']', '`', '"'][..])
+            .to_string();
 
         // Find VALUES clause
-        let values_pos = sql_upper.find("VALUES").ok_or_else(||
-            DatabaseError::ParseError("Missing VALUES clause".to_string()))?;
+        let values_pos = sql_upper
+            .find("VALUES")
+            .ok_or_else(|| DatabaseError::ParseError("Missing VALUES clause".to_string()))?;
 
         // Extract columns if specified
         let table_end = sql.find(&table_name).unwrap() + table_name.len();
@@ -332,7 +433,8 @@ impl AnySQL {
         let columns = if let Some(start) = columns_part.find('(') {
             if let Some(end) = columns_part.find(')') {
                 let columns_str = &columns_part[start + 1..end];
-                columns_str.split(',')
+                columns_str
+                    .split(',')
                     .map(|s| s.trim().trim_matches(&['[', ']', '`', '"'][..]).to_string())
                     .collect()
             } else {
@@ -344,10 +446,12 @@ impl AnySQL {
 
         // Extract values
         let values_part = &sql[values_pos + 6..];
-        let start_pos = values_part.find('(').ok_or_else(||
-            DatabaseError::ParseError("Missing opening parenthesis in VALUES".to_string()))?;
-        let end_pos = values_part.rfind(')').ok_or_else(||
-            DatabaseError::ParseError("Missing closing parenthesis in VALUES".to_string()))?;
+        let start_pos = values_part.find('(').ok_or_else(|| {
+            DatabaseError::ParseError("Missing opening parenthesis in VALUES".to_string())
+        })?;
+        let end_pos = values_part.rfind(')').ok_or_else(|| {
+            DatabaseError::ParseError("Missing closing parenthesis in VALUES".to_string())
+        })?;
 
         let values_str = &values_part[start_pos + 1..end_pos];
         let value_strs: Vec<&str> = values_str.split(',').collect();
@@ -358,17 +462,25 @@ impl AnySQL {
             values.push(value);
         }
 
-        Ok(SqlStatement::Insert { table_name, columns, values })
+        Ok(SqlStatement::Insert {
+            table_name,
+            columns,
+            values,
+        })
     }
 
     fn parse_select_anysql(&self, sql: &str) -> Result<SqlStatement, DatabaseError> {
         let tokens: Vec<&str> = sql.split_whitespace().collect();
 
-        let from_pos = tokens.iter().position(|&token| token.to_uppercase() == "FROM")
+        let from_pos = tokens
+            .iter()
+            .position(|&token| token.to_uppercase() == "FROM")
             .ok_or_else(|| DatabaseError::ParseError("Missing FROM clause".to_string()))?;
 
         if from_pos + 1 >= tokens.len() {
-            return Err(DatabaseError::ParseError("Missing table name after FROM".to_string()));
+            return Err(DatabaseError::ParseError(
+                "Missing table name after FROM".to_string(),
+            ));
         }
 
         let columns: Vec<String> = tokens[1..from_pos]
@@ -377,30 +489,47 @@ impl AnySQL {
             .map(|s| s.trim().trim_matches(&['[', ']', '`', '"'][..]).to_string())
             .collect();
 
-        let table_name = tokens[from_pos + 1].trim_matches(&['[', ']', '`', '"'][..]).to_string();
+        let table_name = tokens[from_pos + 1]
+            .trim_matches(&['[', ']', '`', '"'][..])
+            .to_string();
 
-        let where_clause = if let Some(where_pos) = tokens.iter().position(|&token| token.to_uppercase() == "WHERE") {
+        let where_clause = if let Some(where_pos) = tokens
+            .iter()
+            .position(|&token| token.to_uppercase() == "WHERE")
+        {
             Some(self.parse_where_clause_anysql(&tokens[where_pos + 1..])?)
         } else {
             None
         };
 
-        Ok(SqlStatement::Select { table_name, columns, where_clause })
+        Ok(SqlStatement::Select {
+            table_name,
+            columns,
+            where_clause,
+        })
     }
 
     fn parse_update_anysql(&self, sql: &str) -> Result<SqlStatement, DatabaseError> {
         let tokens: Vec<&str> = sql.split_whitespace().collect();
 
         if tokens.len() < 4 {
-            return Err(DatabaseError::ParseError("Invalid UPDATE syntax".to_string()));
+            return Err(DatabaseError::ParseError(
+                "Invalid UPDATE syntax".to_string(),
+            ));
         }
 
-        let table_name = tokens[1].trim_matches(&['[', ']', '`', '"'][..]).to_string();
+        let table_name = tokens[1]
+            .trim_matches(&['[', ']', '`', '"'][..])
+            .to_string();
 
-        let set_pos = tokens.iter().position(|&token| token.to_uppercase() == "SET")
+        let set_pos = tokens
+            .iter()
+            .position(|&token| token.to_uppercase() == "SET")
             .ok_or_else(|| DatabaseError::ParseError("Missing SET clause".to_string()))?;
 
-        let where_pos = tokens.iter().position(|&token| token.to_uppercase() == "WHERE");
+        let where_pos = tokens
+            .iter()
+            .position(|&token| token.to_uppercase() == "WHERE");
         let set_end = where_pos.unwrap_or(tokens.len());
         let set_tokens = &tokens[set_pos + 1..set_end];
 
@@ -414,7 +543,10 @@ impl AnySQL {
                 return Err(DatabaseError::ParseError("Invalid SET clause".to_string()));
             }
 
-            let column_name = parts[0].trim().trim_matches(&['[', ']', '`', '"'][..]).to_string();
+            let column_name = parts[0]
+                .trim()
+                .trim_matches(&['[', ']', '`', '"'][..])
+                .to_string();
             let value = self.parse_value_anysql(parts[1].trim())?;
             set_clauses.push((column_name, value));
         }
@@ -425,37 +557,59 @@ impl AnySQL {
             None
         };
 
-        Ok(SqlStatement::Update { table_name, set_clauses, where_clause })
+        Ok(SqlStatement::Update {
+            table_name,
+            set_clauses,
+            where_clause,
+        })
     }
 
     fn parse_delete_anysql(&self, sql: &str) -> Result<SqlStatement, DatabaseError> {
         let tokens: Vec<&str> = sql.split_whitespace().collect();
 
         if tokens.len() < 3 || tokens[1].to_uppercase() != "FROM" {
-            return Err(DatabaseError::ParseError("Invalid DELETE syntax".to_string()));
+            return Err(DatabaseError::ParseError(
+                "Invalid DELETE syntax".to_string(),
+            ));
         }
 
-        let table_name = tokens[2].trim_matches(&['[', ']', '`', '"'][..]).to_string();
+        let table_name = tokens[2]
+            .trim_matches(&['[', ']', '`', '"'][..])
+            .to_string();
 
-        let where_clause = if let Some(where_pos) = tokens.iter().position(|&token| token.to_uppercase() == "WHERE") {
+        let where_clause = if let Some(where_pos) = tokens
+            .iter()
+            .position(|&token| token.to_uppercase() == "WHERE")
+        {
             Some(self.parse_where_clause_anysql(&tokens[where_pos + 1..])?)
         } else {
             None
         };
 
-        Ok(SqlStatement::Delete { table_name, where_clause })
+        Ok(SqlStatement::Delete {
+            table_name,
+            where_clause,
+        })
     }
 
     fn parse_where_clause_anysql(&self, tokens: &[&str]) -> Result<WhereClause, DatabaseError> {
         if tokens.len() < 3 {
-            return Err(DatabaseError::ParseError("Invalid WHERE clause".to_string()));
+            return Err(DatabaseError::ParseError(
+                "Invalid WHERE clause".to_string(),
+            ));
         }
 
-        let column = tokens[0].trim_matches(&['[', ']', '`', '"'][..]).to_string();
+        let column = tokens[0]
+            .trim_matches(&['[', ']', '`', '"'][..])
+            .to_string();
         let operator = self.parse_comparison_operator(tokens[1])?;
         let value = self.parse_value_anysql(tokens[2])?;
 
-        Ok(WhereClause { column, operator, value })
+        Ok(WhereClause {
+            column,
+            operator,
+            value,
+        })
     }
 
     fn parse_comparison_operator(&self, op: &str) -> Result<ComparisonOperator, DatabaseError> {
@@ -466,7 +620,10 @@ impl AnySQL {
             "<" => Ok(ComparisonOperator::LessThan),
             ">=" => Ok(ComparisonOperator::GreaterThanOrEqual),
             "<=" => Ok(ComparisonOperator::LessThanOrEqual),
-            _ => Err(DatabaseError::ParseError(format!("Unknown comparison operator: {}", op))),
+            _ => Err(DatabaseError::ParseError(format!(
+                "Unknown comparison operator: {}",
+                op
+            ))),
         }
     }
 
@@ -486,10 +643,11 @@ impl AnySQL {
         }
 
         // Handle quoted strings (all quote types)
-        if (value_str.starts_with('\'') && value_str.ends_with('\'')) ||
-           (value_str.starts_with('"') && value_str.ends_with('"')) ||
-           (value_str.starts_with('`') && value_str.ends_with('`')) {
-            let text = value_str[1..value_str.len()-1].to_string();
+        if (value_str.starts_with('\'') && value_str.ends_with('\''))
+            || (value_str.starts_with('"') && value_str.ends_with('"'))
+            || (value_str.starts_with('`') && value_str.ends_with('`'))
+        {
+            let text = value_str[1..value_str.len() - 1].to_string();
             return Ok(SqlValue::Text(text));
         }
 

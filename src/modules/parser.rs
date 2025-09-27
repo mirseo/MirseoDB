@@ -1,4 +1,7 @@
-use super::types::{SqlStatement, ColumnDefinition, DataType, SqlValue, WhereClause, ComparisonOperator, DatabaseError};
+use super::types::{
+    ColumnDefinition, ComparisonOperator, DataType, DatabaseError, SqlStatement, SqlValue,
+    WhereClause,
+};
 
 #[derive(Debug, Clone)]
 pub enum SqlDialect {
@@ -31,25 +34,35 @@ impl Parser {
             "SELECT" => self.parse_select(&tokens),
             "UPDATE" => self.parse_update(&tokens),
             "DELETE" => self.parse_delete(&tokens),
-            _ => Err(DatabaseError::ParseError(format!("Unsupported statement: {}", tokens[0]))),
+            _ => Err(DatabaseError::ParseError(format!(
+                "Unsupported statement: {}",
+                tokens[0]
+            ))),
         }
     }
 
     fn parse_create(&self, tokens: &[&str]) -> Result<SqlStatement, DatabaseError> {
         if tokens.len() < 3 {
-            return Err(DatabaseError::ParseError("Invalid CREATE syntax".to_string()));
+            return Err(DatabaseError::ParseError(
+                "Invalid CREATE syntax".to_string(),
+            ));
         }
 
         match tokens[1] {
             "DATABASE" => self.parse_create_database(&tokens),
             "TABLE" => self.parse_create_table(&tokens),
-            _ => Err(DatabaseError::ParseError(format!("Unsupported CREATE statement: CREATE {}", tokens[1]))),
+            _ => Err(DatabaseError::ParseError(format!(
+                "Unsupported CREATE statement: CREATE {}",
+                tokens[1]
+            ))),
         }
     }
 
     fn parse_create_database(&self, tokens: &[&str]) -> Result<SqlStatement, DatabaseError> {
         if tokens.len() < 3 || tokens[1] != "DATABASE" {
-            return Err(DatabaseError::ParseError("Invalid CREATE DATABASE syntax".to_string()));
+            return Err(DatabaseError::ParseError(
+                "Invalid CREATE DATABASE syntax".to_string(),
+            ));
         }
 
         let database_name = tokens[2].to_string();
@@ -58,7 +71,9 @@ impl Parser {
 
     fn parse_create_table(&self, tokens: &[&str]) -> Result<SqlStatement, DatabaseError> {
         if tokens.len() < 3 || tokens[1] != "TABLE" {
-            return Err(DatabaseError::ParseError("Invalid CREATE TABLE syntax".to_string()));
+            return Err(DatabaseError::ParseError(
+                "Invalid CREATE TABLE syntax".to_string(),
+            ));
         }
 
         let table_name = tokens[2].to_string();
@@ -67,7 +82,7 @@ impl Parser {
         if tokens.len() == 3 {
             return Ok(SqlStatement::CreateTable {
                 table_name,
-                columns: Vec::new()
+                columns: Vec::new(),
             });
         }
 
@@ -75,8 +90,9 @@ impl Parser {
 
         // Check if there are column definitions in parentheses
         if let Some(start_pos) = sql_str.find('(') {
-            let end_pos = sql_str.rfind(')').ok_or_else(||
-                DatabaseError::ParseError("Missing closing parenthesis".to_string()))?;
+            let end_pos = sql_str.rfind(')').ok_or_else(|| {
+                DatabaseError::ParseError("Missing closing parenthesis".to_string())
+            })?;
 
             let columns_str = &sql_str[start_pos + 1..end_pos];
             let column_defs: Vec<&str> = columns_str.split(',').collect();
@@ -85,7 +101,9 @@ impl Parser {
             for column_def in column_defs {
                 let column_tokens: Vec<&str> = column_def.trim().split_whitespace().collect();
                 if column_tokens.len() < 2 {
-                    return Err(DatabaseError::ParseError("Invalid column definition".to_string()));
+                    return Err(DatabaseError::ParseError(
+                        "Invalid column definition".to_string(),
+                    ));
                 }
 
                 let column_name = column_tokens[0].to_string();
@@ -98,10 +116,12 @@ impl Parser {
                     match column_tokens[i] {
                         "NOT" if i + 1 < column_tokens.len() && column_tokens[i + 1] == "NULL" => {
                             nullable = false;
-                        },
-                        "PRIMARY" if i + 1 < column_tokens.len() && column_tokens[i + 1] == "KEY" => {
+                        }
+                        "PRIMARY"
+                            if i + 1 < column_tokens.len() && column_tokens[i + 1] == "KEY" =>
+                        {
                             primary_key = true;
-                        },
+                        }
                         _ => {}
                     }
                 }
@@ -114,47 +134,59 @@ impl Parser {
                 });
             }
 
-            Ok(SqlStatement::CreateTable { table_name, columns })
+            Ok(SqlStatement::CreateTable {
+                table_name,
+                columns,
+            })
         } else {
             // No parentheses found, create empty table
             Ok(SqlStatement::CreateTable {
                 table_name,
-                columns: Vec::new()
+                columns: Vec::new(),
             })
         }
     }
 
     fn parse_insert(&self, tokens: &[&str]) -> Result<SqlStatement, DatabaseError> {
         if tokens.len() < 4 || tokens[1] != "INTO" {
-            return Err(DatabaseError::ParseError("Invalid INSERT syntax".to_string()));
+            return Err(DatabaseError::ParseError(
+                "Invalid INSERT syntax".to_string(),
+            ));
         }
 
         let table_name = tokens[2].to_string();
 
         let sql_str = tokens.join(" ");
-        let values_pos = sql_str.find("VALUES").ok_or_else(||
-            DatabaseError::ParseError("Missing VALUES clause".to_string()))?;
+        let values_pos = sql_str
+            .find("VALUES")
+            .ok_or_else(|| DatabaseError::ParseError("Missing VALUES clause".to_string()))?;
 
-        let columns_part = &sql_str[sql_str.find(table_name.as_str()).unwrap() + table_name.len()..values_pos];
+        let columns_part =
+            &sql_str[sql_str.find(table_name.as_str()).unwrap() + table_name.len()..values_pos];
 
         let columns = if let Some(start) = columns_part.find('(') {
             if let Some(end) = columns_part.find(')') {
                 let columns_str = &columns_part[start + 1..end];
-                columns_str.split(',')
+                columns_str
+                    .split(',')
                     .map(|s| s.trim().to_string())
                     .collect()
             } else {
-                return Err(DatabaseError::ParseError("Missing closing parenthesis in column list".to_string()));
+                return Err(DatabaseError::ParseError(
+                    "Missing closing parenthesis in column list".to_string(),
+                ));
             }
         } else {
             vec!["*".to_string()]
         };
 
         let values_part = &sql_str[values_pos + 6..];
-        let start_pos = values_part.find('(').ok_or_else(||
-            DatabaseError::ParseError("Missing opening parenthesis in VALUES".to_string()))?;
-        let end_pos = values_part.rfind(')').ok_or_else(||
-            DatabaseError::ParseError("Missing closing parenthesis in VALUES".to_string()))?;
+        let start_pos = values_part.find('(').ok_or_else(|| {
+            DatabaseError::ParseError("Missing opening parenthesis in VALUES".to_string())
+        })?;
+        let end_pos = values_part.rfind(')').ok_or_else(|| {
+            DatabaseError::ParseError("Missing closing parenthesis in VALUES".to_string())
+        })?;
 
         let values_str = &values_part[start_pos + 1..end_pos];
         let value_strs: Vec<&str> = values_str.split(',').collect();
@@ -165,15 +197,23 @@ impl Parser {
             values.push(value);
         }
 
-        Ok(SqlStatement::Insert { table_name, columns, values })
+        Ok(SqlStatement::Insert {
+            table_name,
+            columns,
+            values,
+        })
     }
 
     fn parse_select(&self, tokens: &[&str]) -> Result<SqlStatement, DatabaseError> {
-        let from_pos = tokens.iter().position(|&token| token == "FROM")
+        let from_pos = tokens
+            .iter()
+            .position(|&token| token == "FROM")
             .ok_or_else(|| DatabaseError::ParseError("Missing FROM clause".to_string()))?;
 
         if from_pos + 1 >= tokens.len() {
-            return Err(DatabaseError::ParseError("Missing table name after FROM".to_string()));
+            return Err(DatabaseError::ParseError(
+                "Missing table name after FROM".to_string(),
+            ));
         }
 
         let columns: Vec<String> = tokens[1..from_pos]
@@ -184,23 +224,32 @@ impl Parser {
 
         let table_name = tokens[from_pos + 1].to_string();
 
-        let where_clause = if let Some(where_pos) = tokens.iter().position(|&token| token == "WHERE") {
-            Some(self.parse_where_clause(&tokens[where_pos + 1..])?)
-        } else {
-            None
-        };
+        let where_clause =
+            if let Some(where_pos) = tokens.iter().position(|&token| token == "WHERE") {
+                Some(self.parse_where_clause(&tokens[where_pos + 1..])?)
+            } else {
+                None
+            };
 
-        Ok(SqlStatement::Select { table_name, columns, where_clause })
+        Ok(SqlStatement::Select {
+            table_name,
+            columns,
+            where_clause,
+        })
     }
 
     fn parse_update(&self, tokens: &[&str]) -> Result<SqlStatement, DatabaseError> {
         if tokens.len() < 4 {
-            return Err(DatabaseError::ParseError("Invalid UPDATE syntax".to_string()));
+            return Err(DatabaseError::ParseError(
+                "Invalid UPDATE syntax".to_string(),
+            ));
         }
 
         let table_name = tokens[1].to_string();
 
-        let set_pos = tokens.iter().position(|&token| token == "SET")
+        let set_pos = tokens
+            .iter()
+            .position(|&token| token == "SET")
             .ok_or_else(|| DatabaseError::ParseError("Missing SET clause".to_string()))?;
 
         let where_pos = tokens.iter().position(|&token| token == "WHERE");
@@ -229,35 +278,51 @@ impl Parser {
             None
         };
 
-        Ok(SqlStatement::Update { table_name, set_clauses, where_clause })
+        Ok(SqlStatement::Update {
+            table_name,
+            set_clauses,
+            where_clause,
+        })
     }
 
     fn parse_delete(&self, tokens: &[&str]) -> Result<SqlStatement, DatabaseError> {
         if tokens.len() < 3 || tokens[1] != "FROM" {
-            return Err(DatabaseError::ParseError("Invalid DELETE syntax".to_string()));
+            return Err(DatabaseError::ParseError(
+                "Invalid DELETE syntax".to_string(),
+            ));
         }
 
         let table_name = tokens[2].to_string();
 
-        let where_clause = if let Some(where_pos) = tokens.iter().position(|&token| token == "WHERE") {
-            Some(self.parse_where_clause(&tokens[where_pos + 1..])?)
-        } else {
-            None
-        };
+        let where_clause =
+            if let Some(where_pos) = tokens.iter().position(|&token| token == "WHERE") {
+                Some(self.parse_where_clause(&tokens[where_pos + 1..])?)
+            } else {
+                None
+            };
 
-        Ok(SqlStatement::Delete { table_name, where_clause })
+        Ok(SqlStatement::Delete {
+            table_name,
+            where_clause,
+        })
     }
 
     fn parse_where_clause(&self, tokens: &[&str]) -> Result<WhereClause, DatabaseError> {
         if tokens.len() < 3 {
-            return Err(DatabaseError::ParseError("Invalid WHERE clause".to_string()));
+            return Err(DatabaseError::ParseError(
+                "Invalid WHERE clause".to_string(),
+            ));
         }
 
         let column = tokens[0].to_string();
         let operator = self.parse_comparison_operator(tokens[1])?;
         let value = self.parse_value(tokens[2])?;
 
-        Ok(WhereClause { column, operator, value })
+        Ok(WhereClause {
+            column,
+            operator,
+            value,
+        })
     }
 
     fn parse_comparison_operator(&self, op: &str) -> Result<ComparisonOperator, DatabaseError> {
@@ -268,7 +333,10 @@ impl Parser {
             "<" => Ok(ComparisonOperator::LessThan),
             ">=" => Ok(ComparisonOperator::GreaterThanOrEqual),
             "<=" => Ok(ComparisonOperator::LessThanOrEqual),
-            _ => Err(DatabaseError::ParseError(format!("Unknown comparison operator: {}", op))),
+            _ => Err(DatabaseError::ParseError(format!(
+                "Unknown comparison operator: {}",
+                op
+            ))),
         }
     }
 
@@ -284,7 +352,7 @@ impl Parser {
                 SqlDialect::MariaSql => self.parse_maria_type(&type_upper),
                 SqlDialect::OracleSql => self.parse_oracle_type(&type_upper),
                 SqlDialect::Standard => Err(DatabaseError::InvalidDataType(type_str.to_string())),
-            }
+            },
         }
     }
 
@@ -330,12 +398,12 @@ impl Parser {
         }
 
         if value_str.starts_with('\'') && value_str.ends_with('\'') {
-            let text = value_str[1..value_str.len()-1].to_string();
+            let text = value_str[1..value_str.len() - 1].to_string();
             return Ok(SqlValue::Text(text));
         }
 
         if value_str.starts_with('"') && value_str.ends_with('"') {
-            let text = value_str[1..value_str.len()-1].to_string();
+            let text = value_str[1..value_str.len() - 1].to_string();
             return Ok(SqlValue::Text(text));
         }
 

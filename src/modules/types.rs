@@ -19,6 +19,8 @@ pub struct Table {
     pub name: String,
     pub columns: Vec<ColumnDefinition>,
     pub rows: Vec<Row>,
+    pub index_manager: super::btree::IndexManager,
+    pub next_row_id: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -91,4 +93,8 @@ pub enum DatabaseError {
     ParseError(String),
     IoError(String),
     InvalidDataType(String),
+    UniqueConstraintViolation(String),
+    IndexAlreadyExists(String),
+    IndexNotFound(String),
+    PrimaryKeyViolation(String),
 }

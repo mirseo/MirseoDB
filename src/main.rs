@@ -1,10 +1,30 @@
 mod modules;
 
-use modules::{Database, Parser, SqlDialect};
+use modules::{start_health_server, Database, AnySQL};
 use std::io::{self, Write};
 
+const DEFAULT_HEALTH_PORT: u16 = 3306;
+
 fn main() {
-    println!("[MirseoDB] Server is running on port : {}", 8124);
+    let health_port = match start_health_server(DEFAULT_HEALTH_PORT) {
+        Ok(port) => {
+            println!(
+                "[MirseoDB] Health endpoint ready on http://127.0.0.1:{}/health",
+                port
+            );
+            Some(port)
+        }
+        Err(err) => {
+            eprintln!("[MirseoDB] Health server failed to start: {}", err);
+            None
+        }
+    };
+
+    if let Some(port) = health_port {
+        println!("[MirseoDB] Server is running on port : {}", port);
+    } else {
+        println!("[MirseoDB] Server is running without an HTTP health endpoint.");
+    }
 
     let mut database = match get_database_instance() {
         Ok(db) => db,
@@ -14,7 +34,8 @@ fn main() {
         }
     };
 
-    let parser = get_parser_with_dialect();
+    let parser = AnySQL::new();
+    println!("[MirseoDB] Initialized - All SQL dialects supported automatically!");
 
     loop {
         print!("MirseoDB> ");
@@ -86,43 +107,7 @@ fn get_database_instance() -> Result<Database, modules::DatabaseError> {
     }
 }
 
-fn get_parser_with_dialect() -> Parser {
-    println!("\nSelect SQL dialect:");
-    println!("1. Standard SQL (default)");
-    println!("2. MS-SQL");
-    println!("3. MariaDB/MySQL");
-    println!("4. Oracle SQL");
-
-    print!("Choice (1-4): ");
-    io::stdout().flush().unwrap();
-
-    let mut choice = String::new();
-    io::stdin().read_line(&mut choice).unwrap();
-    let choice = choice.trim();
-
-    let dialect = match choice {
-        "2" => {
-            println!("MS-SQL dialect selected");
-            SqlDialect::MsSql
-        }
-        "3" => {
-            println!("MariaDB/MySQL dialect selected");
-            SqlDialect::MariaSql
-        }
-        "4" => {
-            println!("Oracle SQL dialect selected");
-            SqlDialect::OracleSql
-        }
-        _ => {
-            println!("Standard SQL dialect selected (default)");
-            SqlDialect::Standard
-        }
-    };
-
-    Parser::new(dialect)
-}
-
-fn execute_sql_command(database: &mut Database, parser: &Parser, command: &str) {
+fn execute_sql_command(database: &mut Database, parser: &AnySQL, command: &str) {
     match parser.parse(command) {
         Ok(statement) => {
             match database.execute(statement) {

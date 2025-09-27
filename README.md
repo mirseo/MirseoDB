@@ -1,5 +1,6 @@
 # MirseoDB
-MirseoDB - New Type Database
+MirseoDB - New Type Database  
+Warn : This Project is in early development, expect breaking changes.
 
 ## Development
 

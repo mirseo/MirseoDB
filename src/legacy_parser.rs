@@ -235,6 +235,7 @@ impl Parser {
             table_name,
             columns,
             where_clause,
+            optimization_hint: None,
         })
     }
 

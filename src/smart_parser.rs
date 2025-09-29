@@ -720,6 +720,7 @@ impl AnySQL {
             table_name,
             columns,
             where_clause,
+            optimization_hint: None,
         })
     }
 

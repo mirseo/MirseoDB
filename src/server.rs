@@ -201,7 +201,10 @@ fn handle_client(mut stream: TcpStream, state: Arc<ApiServerState>) {
         ("GET", "/setup/status") => Some(handle_setup_status()),
         ("POST", "/setup/init") => Some(handle_setup_init(&state, &headers, body_bytes)),
         ("POST", "/setup/complete") => Some(handle_setup_complete(&state, &headers, body_bytes)),
-        ("POST", "/query") | ("POST", "/api/query") => {
+        ("GET", "/query") => {
+            Some(handle_get_query_request(&state, &headers, path))
+        }
+        ("POST", "/query") | ("PUT", "/query") | ("DELETE", "/query") | ("PATCH", "/query") | ("POST", "/api/query") => {
             Some(handle_query_request(&state, &headers, body_bytes))
         }
         ("POST", "/2fa/setup") => Some(handle_2fa_setup(&state, &headers, body_bytes)),
@@ -1042,6 +1045,15 @@ fn database_error_to_string(error: DatabaseError) -> String {
         }
         DatabaseError::IndexNotFound(name) => format!("Index not found: {}", name),
         DatabaseError::PrimaryKeyViolation(msg) => format!("Primary key violation: {}", msg),
+        DatabaseError::PermissionDenied(msg) => format!("Permission denied: {}", msg),
+        DatabaseError::InvalidCredentials(msg) => format!("Invalid credentials: {}", msg),
+        DatabaseError::TwoFactorAuthRequired(msg) => format!("Two-factor authentication required: {}", msg),
+        DatabaseError::NetworkError(msg) => format!("Network error: {}", msg),
+        DatabaseError::HttpError(msg) => format!("HTTP error: {}", msg),
+        DatabaseError::InvalidSqlSyntax(msg) => format!("Invalid SQL syntax: {}", msg),
+        DatabaseError::SqlInjectionDetected => format!("SQL injection attempt detected"),
+        DatabaseError::QueryTooComplex => format!("Query too complex"),
+        DatabaseError::InvalidIndexHint(msg) => format!("Invalid index hint: {}", msg),
     }
 }
 
@@ -1731,4 +1743,269 @@ fn handle_time_request() -> HttpResponse {
     body.push('}');
 
     HttpResponse::json("200 OK", body)
+}
+
+fn handle_get_query_request(
+    state: &Arc<ApiServerState>,
+    headers: &HashMap<String, String>,
+    path: &str,
+) -> HttpResponse {
+    let start_time = Instant::now();
+
+    let sql = if let Some(query_start) = path.find('?') {
+        let query_string = &path[query_start + 1..];
+        parse_url_query_params(query_string).get("sql").cloned()
+    } else {
+        None
+    };
+
+    let sql = match sql {
+        Some(s) if !s.is_empty() => s,
+        _ => {
+            return HttpResponse::json(
+                "400 Bad Request",
+                error_json("Missing 'sql' query parameter", start_time.elapsed()),
+            );
+        }
+    };
+
+    let request = QueryRequest {
+        sql: url_decode(&sql),
+        auth_token: extract_auth_token(headers, None),
+        totp_token: None,
+        email: None,
+    };
+
+    execute_query_request(state, request, start_time, false)
+}
+
+fn parse_url_query_params(query_string: &str) -> HashMap<String, String> {
+    let mut params = HashMap::new();
+
+    for pair in query_string.split('&') {
+        if let Some((key, value)) = pair.split_once('=') {
+            params.insert(key.to_string(), value.to_string());
+        }
+    }
+
+    params
+}
+
+fn url_decode(input: &str) -> String {
+    let mut result = String::new();
+    let mut chars = input.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch == '%' {
+            if let (Some(hex1), Some(hex2)) = (chars.next(), chars.next()) {
+                if let Ok(byte) = u8::from_str_radix(&format!("{}{}", hex1, hex2), 16) {
+                    result.push(byte as char);
+                } else {
+                    result.push(ch);
+                    result.push(hex1);
+                    result.push(hex2);
+                }
+            } else {
+                result.push(ch);
+            }
+        } else if ch == '+' {
+            result.push(' ');
+        } else {
+            result.push(ch);
+        }
+    }
+
+    result
+}
+
+fn execute_query_request(
+    state: &Arc<ApiServerState>,
+    request: QueryRequest,
+    start_time: Instant,
+    sanitized_applied: bool,
+) -> HttpResponse {
+    let QueryRequest {
+        sql: mut sql_text,
+        auth_token: request_token,
+        totp_token: request_totp,
+        email: request_email,
+    } = request;
+
+    let provided_token = extract_auth_token(&HashMap::new(), request_token.clone());
+
+    let mut sanitized_applied = sanitized_applied;
+    let config = ConfigManager::load();
+    if config.sql_injection_protect {
+        if let Some(filtered) = sanitize_sql_input(&sql_text) {
+            sanitized_applied = true;
+            eprintln!("[MirseoDB][security] Suspicious SQL patterns detected; sanitized request");
+            sql_text = filtered;
+        }
+    }
+
+    if let Some(expected) = state.auth_token.as_ref() {
+        match provided_token {
+            Some(ref token) if token == expected => {}
+            _ => {
+                let mut body = error_json("Invalid or missing auth token", start_time.elapsed());
+                if sanitized_applied {
+                    insert_sanitized_flag(&mut body);
+                }
+                return HttpResponse::json("401 Unauthorized", body);
+            }
+        }
+    }
+
+    let auth_config = match AuthConfig::load() {
+        Ok(config) => config,
+        Err(e) => {
+            let mut body = error_json(&format!("Auth config error: {}", e), start_time.elapsed());
+            if sanitized_applied {
+                insert_sanitized_flag(&mut body);
+            }
+            return HttpResponse::json("500 Internal Server Error", body);
+        }
+    };
+
+    if !auth_config.is_setup_completed() {
+        let mut body = error_json(
+            "Database setup not completed. Please complete initial setup at /setup/init",
+            start_time.elapsed(),
+        );
+        if sanitized_applied {
+            insert_sanitized_flag(&mut body);
+        }
+        return HttpResponse::json("503 Service Unavailable", body);
+    }
+
+    if let Some(email) = request_email.as_ref() {
+        if !auth_config.check_sql_permission(email, &sql_text) {
+            let user_role = auth_config.get_user_role(email).unwrap_or("unknown");
+            let mut body = error_json(
+                &format!(
+                    "SQL permission denied for user '{}' with role '{}'",
+                    email, user_role
+                ),
+                start_time.elapsed(),
+            );
+            if sanitized_applied {
+                insert_sanitized_flag(&mut body);
+            }
+            return HttpResponse::json("403 Forbidden", body);
+        }
+    }
+
+    let statement = match state.parser.parse(&sql_text) {
+        Ok(stmt) => stmt,
+        Err(err) => {
+            let mut body = error_json(&format!("SQL parse error: {:?}", err), start_time.elapsed());
+            if sanitized_applied {
+                insert_sanitized_flag(&mut body);
+            }
+            return HttpResponse::json("400 Bad Request", body);
+        }
+    };
+
+    if statement.requires_2fa() {
+        let user_id = "default";
+
+        match request_totp {
+            Some(totp) if !totp.is_empty() => {
+                let two_factor_auth = match state.two_factor_auth.lock() {
+                    Ok(guard) => guard,
+                    Err(_) => {
+                        return HttpResponse::json(
+                            "500 Internal Server Error",
+                            error_json("2FA system error", start_time.elapsed()),
+                        );
+                    }
+                };
+
+                if !two_factor_auth.verify_token(user_id, &totp) {
+                    let mut body = error_json(
+                        &format!(
+                            "2FA required for {} operation. Invalid or expired TOTP token.",
+                            statement.get_operation_name()
+                        ),
+                        start_time.elapsed(),
+                    );
+                    if sanitized_applied {
+                        insert_sanitized_flag(&mut body);
+                    }
+                    insert_2fa_required_flag(&mut body);
+                    return HttpResponse::json("403 Forbidden", body);
+                }
+            }
+            _ => {
+                let mut body = error_json(
+                    &format!("2FA required for {} operation. Please provide 'authtoken' field with your TOTP code.",
+                            statement.get_operation_name()),
+                    start_time.elapsed(),
+                );
+                if sanitized_applied {
+                    insert_sanitized_flag(&mut body);
+                }
+                insert_2fa_required_flag(&mut body);
+                return HttpResponse::json("403 Forbidden", body);
+            }
+        }
+    }
+
+    let execution_result = {
+        let mut db = match state.database.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                return HttpResponse::json(
+                    "500 Internal Server Error",
+                    error_json(
+                        &format!("Database lock poisoned: {}", poisoned),
+                        start_time.elapsed(),
+                    ),
+                );
+            }
+        };
+
+        db.execute(statement)
+    };
+
+    match execution_result {
+        Ok(rows) => {
+            let elapsed = start_time.elapsed();
+            let mut body = String::from("{");
+            body.push_str("\"status\":\"ok\"");
+            body.push_str(",\"status_code\":200");
+            body.push_str(",\"row_count\":");
+            body.push_str(&rows.len().to_string());
+            body.push_str(",\"rows\":");
+            body.push_str(&rows_to_json(&rows));
+            if rows.is_empty() {
+                body.push_str(",\"message\":\"Command executed successfully\"");
+            }
+            append_execution_time(&mut body, elapsed);
+            body.push('}');
+            if sanitized_applied {
+                insert_sanitized_flag(&mut body);
+            }
+
+            HttpResponse::json("200 OK", body)
+        }
+        Err(err) => {
+            let elapsed = start_time.elapsed();
+
+            if let Some(fallback_server) = state.route_config.get_fallback_server() {
+                if let Ok(forward_result) =
+                    attempt_forward_request(state, &HashMap::new(), &[], fallback_server)
+                {
+                    return forward_result;
+                }
+            }
+
+            let mut body = error_json(&database_error_to_string(err), elapsed);
+            if sanitized_applied {
+                insert_sanitized_flag(&mut body);
+            }
+
+            HttpResponse::json("400 Bad Request", body)
+        }
+    }
 }

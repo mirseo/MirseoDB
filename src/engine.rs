@@ -115,6 +115,7 @@ impl Database {
                 table_name,
                 columns,
                 where_clause,
+                optimization_hint,
             } => self.select_with_indexes(table_name, columns, where_clause),
             SqlStatement::Update {
                 table_name,
@@ -287,6 +288,29 @@ impl Database {
                 }
 
                 self.storage.save_tables(&self.tables)?;
+                Ok(vec![])
+            }
+
+            SqlStatement::ComplexSelect {
+                table_name: _,
+                columns: _,
+                complex_where: _,
+                optimization_hint: _,
+                order_by: _,
+                limit: _,
+                offset: _,
+            } => {
+                Ok(vec![])
+            }
+            SqlStatement::CreateCompositeIndex {
+                index_name: _,
+                table_name: _,
+                column_names: _,
+                is_unique: _,
+            } => {
+                Ok(vec![])
+            }
+            SqlStatement::DropIndex { index_name: _ } => {
                 Ok(vec![])
             }
         }

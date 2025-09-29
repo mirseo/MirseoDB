@@ -57,6 +57,25 @@ pub enum SqlStatement {
         table_name: String,
         columns: Vec<String>,
         where_clause: Option<WhereClause>,
+        optimization_hint: Option<QueryOptimizationHint>,
+    },
+    ComplexSelect {
+        table_name: String,
+        columns: Vec<String>,
+        complex_where: Option<ComplexWhereClause>,
+        optimization_hint: Option<QueryOptimizationHint>,
+        order_by: Option<Vec<OrderBy>>,
+        limit: Option<usize>,
+        offset: Option<usize>,
+    },
+    CreateCompositeIndex {
+        index_name: String,
+        table_name: String,
+        column_names: Vec<String>,
+        is_unique: bool,
+    },
+    DropIndex {
+        index_name: String,
     },
     Update {
         table_name: String,
@@ -77,6 +96,18 @@ pub enum SqlStatement {
         table_name: String,
         action: AlterAction,
     },
+}
+
+#[derive(Debug, Clone)]
+pub struct OrderBy {
+    pub column: String,
+    pub direction: SortDirection,
+}
+
+#[derive(Debug, Clone)]
+pub enum SortDirection {
+    Asc,
+    Desc,
 }
 
 #[derive(Debug, Clone)]
@@ -109,6 +140,9 @@ impl SqlStatement {
             SqlStatement::CreateTable { .. } => "CREATE TABLE",
             SqlStatement::Insert { .. } => "INSERT",
             SqlStatement::Select { .. } => "SELECT",
+            SqlStatement::ComplexSelect { .. } => "COMPLEX SELECT",
+            SqlStatement::CreateCompositeIndex { .. } => "CREATE COMPOSITE INDEX",
+            SqlStatement::DropIndex { .. } => "DROP INDEX",
             SqlStatement::Update { .. } => "UPDATE",
             SqlStatement::Delete { .. } => "DELETE",
             SqlStatement::DropTable { .. } => "DROP TABLE",
@@ -123,6 +157,51 @@ pub struct WhereClause {
     pub column: String,
     pub operator: ComparisonOperator,
     pub value: SqlValue,
+}
+
+#[derive(Debug, Clone)]
+pub struct ComplexWhereClause {
+    pub conditions: Vec<WhereCondition>,
+    pub logical_operators: Vec<LogicalOperator>,
+}
+
+#[derive(Debug, Clone)]
+pub enum WhereCondition {
+    Simple(WhereClause),
+    Nested(ComplexWhereClause),
+    In { column: String, values: Vec<SqlValue> },
+    Between { column: String, start: SqlValue, end: SqlValue },
+    Like { column: String, pattern: String },
+    IsNull { column: String },
+    IsNotNull { column: String },
+}
+
+#[derive(Debug, Clone)]
+pub enum LogicalOperator {
+    And,
+    Or,
+    Not,
+}
+
+#[derive(Debug, Clone)]
+pub struct IndexHint {
+    pub hint_type: IndexHintType,
+    pub index_names: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub enum IndexHintType {
+    Use,
+    Force,
+    Ignore,
+}
+
+#[derive(Debug, Clone)]
+pub struct QueryOptimizationHint {
+    pub index_hints: Option<IndexHint>,
+    pub force_index_scan: bool,
+    pub disable_optimization: bool,
+    pub max_rows: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -141,9 +220,51 @@ pub enum DatabaseError {
     ColumnNotFound(String),
     ParseError(String),
     IoError(String),
-    InvalidDataType(String),
     UniqueConstraintViolation(String),
-    IndexAlreadyExists(String),
-    IndexNotFound(String),
     PrimaryKeyViolation(String),
+    IndexAlreadyExists(String),
+    InvalidDataType(String),
+    PermissionDenied(String),
+    IndexNotFound(String),
+    InvalidCredentials(String),
+    TwoFactorAuthRequired(String),
+    NetworkError(String),
+    HttpError(String),
+    InvalidSqlSyntax(String),
+    SqlInjectionDetected,
+    QueryTooComplex,
+    InvalidIndexHint(String),
 }
+
+impl std::fmt::Display for DatabaseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DatabaseError::TableNotFound(name) => write!(f, "Table '{}' not found", name),
+            DatabaseError::ColumnNotFound(name) => write!(f, "Column '{}' not found", name),
+            DatabaseError::ParseError(msg) => write!(f, "Parse error: {}", msg),
+            DatabaseError::IoError(msg) => write!(f, "IO error: {}", msg),
+            DatabaseError::UniqueConstraintViolation(msg) => {
+                write!(f, "Unique constraint violation: {}", msg)
+            }
+            DatabaseError::PrimaryKeyViolation(msg) => {
+                write!(f, "Primary key violation: {}", msg)
+            }
+            DatabaseError::IndexAlreadyExists(name) => write!(f, "Index '{}' already exists", name),
+            DatabaseError::InvalidDataType(msg) => write!(f, "Invalid data type: {}", msg),
+            DatabaseError::PermissionDenied(msg) => write!(f, "Permission denied: {}", msg),
+            DatabaseError::IndexNotFound(name) => write!(f, "Index '{}' not found", name),
+            DatabaseError::InvalidCredentials(msg) => write!(f, "Invalid credentials: {}", msg),
+            DatabaseError::TwoFactorAuthRequired(msg) => {
+                write!(f, "Two-factor authentication required: {}", msg)
+            }
+            DatabaseError::NetworkError(msg) => write!(f, "Network error: {}", msg),
+            DatabaseError::HttpError(msg) => write!(f, "HTTP error: {}", msg),
+            DatabaseError::InvalidSqlSyntax(msg) => write!(f, "Invalid SQL syntax: {}", msg),
+            DatabaseError::SqlInjectionDetected => write!(f, "SQL injection attempt detected"),
+            DatabaseError::QueryTooComplex => write!(f, "Query too complex"),
+            DatabaseError::InvalidIndexHint(msg) => write!(f, "Invalid index hint: {}", msg),
+        }
+    }
+}
+
+impl std::error::Error for DatabaseError {}

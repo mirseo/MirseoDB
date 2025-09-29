@@ -3,12 +3,220 @@ use super::core_types::{
     WhereClause,
 };
 use super::security::{normalize_identifier, normalize_table_name};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::hash::{Hash, Hasher};
+use std::collections::hash_map::DefaultHasher;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
+
+
+#[derive(Debug, Clone)]
+pub struct DialectCache {
+    cache: HashMap<u64, CachedDialectResult>,
+    access_order: VecDeque<u64>,
+    max_size: usize,
+    hits: u64,
+    misses: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct CachedDialectResult {
+    dialect: DetectedDialect,
+    confidence_score: f32,
+    preprocessing_time_ns: u64,
+    timestamp: std::time::Instant,
+}
+
+#[derive(Debug, Clone)]
+pub struct CachedSQLAnalysis {
+    statement_type: StatementType,
+    detected_dialect: DetectedDialect,
+    original_sql: String,
+    preprocessed_sql: String,      // 미리 계산된 uppercase SQL
+    tokens: Vec<String>,           // 미리 계산된 토큰들
+    sql_hash: u64,                // SQL 문의 해시값
+    confidence_score: f32,         // dialect 감지 신뢰도
+    processing_time_ns: u64,       // 처리 시간 (나노초)
+}
+
+#[derive(Debug, Clone)]
+pub struct KeywordHashMatcher {
+    dialect_keywords: HashMap<DetectedDialect, HashMap<String, f32>>, // 키워드 → 가중치
+    keyword_to_dialects: HashMap<String, Vec<(DetectedDialect, f32)>>, // 역 인덱스
+}
+
+#[derive(Debug, Clone)]
+pub struct PerformanceMetrics {
+    total_queries: u64,
+    cache_hits: u64,
+    cache_misses: u64,
+    avg_parse_time_ns: u64,
+    dialect_accuracy: f32,
+}
+
+impl DialectCache {
+    pub fn new(max_size: usize) -> Self {
+        Self {
+            cache: HashMap::new(),
+            access_order: VecDeque::new(),
+            max_size,
+            hits: 0,
+            misses: 0,
+        }
+    }
+
+    pub fn get(&mut self, sql_hash: u64) -> Option<&CachedDialectResult> {
+        if let Some(result) = self.cache.get(&sql_hash) {
+            // LRU: 최근 사용된 항목을 뒤로 이동
+            if let Some(pos) = self.access_order.iter().position(|&x| x == sql_hash) {
+                self.access_order.remove(pos);
+            }
+            self.access_order.push_back(sql_hash);
+            self.hits += 1;
+            Some(result)
+        } else {
+            self.misses += 1;
+            None
+        }
+    }
+
+    pub fn insert(&mut self, sql_hash: u64, result: CachedDialectResult) {
+        // 캐시 크기 제한 확인
+        if self.cache.len() >= self.max_size && !self.cache.contains_key(&sql_hash) {
+            // LRU: 가장 오래된 항목 제거
+            if let Some(oldest) = self.access_order.pop_front() {
+                self.cache.remove(&oldest);
+            }
+        }
+
+        self.cache.insert(sql_hash, result);
+        if let Some(pos) = self.access_order.iter().position(|&x| x == sql_hash) {
+            self.access_order.remove(pos);
+        }
+        self.access_order.push_back(sql_hash);
+    }
+
+    pub fn hit_rate(&self) -> f32 {
+        if self.hits + self.misses == 0 {
+            0.0
+        } else {
+            self.hits as f32 / (self.hits + self.misses) as f32
+        }
+    }
+}
+
+impl KeywordHashMatcher {
+    pub fn new() -> Self {
+        let mut matcher = Self {
+            dialect_keywords: HashMap::new(),
+            keyword_to_dialects: HashMap::new(),
+        };
+        matcher.initialize_keyword_maps();
+        matcher
+    }
+
+    fn initialize_keyword_maps(&mut self) {
+        // 🎯 HYPERTHINKING: 키워드별 가중치를 세밀하게 조정하여 정확도 극대화
+
+        // MS-SQL 키워드들 (높은 신뢰도)
+        let mssql_keywords = vec![
+            ("NVARCHAR", 0.95), ("NTEXT", 0.90), ("NCHAR", 0.85),
+            ("MONEY", 0.80), ("SMALLMONEY", 0.85), ("IDENTITY", 0.90),
+            ("UNIQUEIDENTIFIER", 0.95), ("DATETIME2", 0.90),
+            ("DATETIMEOFFSET", 0.95), ("HIERARCHYID", 0.95),
+            ("[", 0.70), ("]", 0.70), ("NOLOCK", 0.85), ("READUNCOMMITTED", 0.80),
+        ];
+
+        // MySQL 키워드들 (높은 신뢰도)
+        let mysql_keywords = vec![
+            ("AUTO_INCREMENT", 0.95), ("LONGTEXT", 0.90), ("MEDIUMTEXT", 0.85),
+            ("TINYTEXT", 0.80), ("TINYINT", 0.75), ("MEDIUMINT", 0.80),
+            ("BIGINT", 0.60), ("UNSIGNED", 0.85), ("ZEROFILL", 0.95),
+            ("`", 0.75), ("ENGINE", 0.70), ("CHARSET", 0.75),
+            ("COLLATE", 0.70), ("CASCADE", 0.60),
+        ];
+
+        // Oracle 키워드들 (높은 신뢰도)
+        let oracle_keywords = vec![
+            ("VARCHAR2", 0.95), ("NVARCHAR2", 0.95), ("CLOB", 0.90),
+            ("NCLOB", 0.90), ("NUMBER", 0.80), ("SEQUENCE", 0.85),
+            ("NEXTVAL", 0.95), ("CURRVAL", 0.95), ("ROWNUM", 0.95),
+            ("ROWID", 0.90), ("DUAL", 0.95), ("SYSDATE", 0.90),
+        ];
+
+        // Standard SQL 키워드들 (낮은 신뢰도)
+        let standard_keywords = vec![
+            ("VARCHAR", 0.30), ("INTEGER", 0.35), ("DECIMAL", 0.40),
+            ("TIMESTAMP", 0.45), ("PRIMARY", 0.25), ("KEY", 0.20),
+            ("FOREIGN", 0.30), ("REFERENCES", 0.35), ("CHECK", 0.25),
+            ("UNIQUE", 0.30), ("DEFAULT", 0.25),
+        ];
+
+        // 각 dialect별 키워드 맵 구성
+        self.insert_dialect_keywords(DetectedDialect::MsSQL, mssql_keywords);
+        self.insert_dialect_keywords(DetectedDialect::MySQL, mysql_keywords);
+        self.insert_dialect_keywords(DetectedDialect::Oracle, oracle_keywords);
+        self.insert_dialect_keywords(DetectedDialect::Standard, standard_keywords);
+    }
+
+    fn insert_dialect_keywords(&mut self, dialect: DetectedDialect, keywords: Vec<(&str, f32)>) {
+        let mut dialect_map = HashMap::new();
+
+        for (keyword, weight) in keywords {
+            let key = keyword.to_string();
+            dialect_map.insert(key.clone(), weight);
+
+            // 역 인덱스 구성
+            self.keyword_to_dialects
+                .entry(key)
+                .or_insert_with(Vec::new)
+                .push((dialect.clone(), weight));
+        }
+
+        self.dialect_keywords.insert(dialect, dialect_map);
+    }
+
+    pub fn detect_dialect_optimized(&self, sql_upper: &str) -> (DetectedDialect, f32) {
+        let mut dialect_scores: HashMap<DetectedDialect, f32> = HashMap::new();
+
+        // 초기화
+        dialect_scores.insert(DetectedDialect::Standard, 1.0);
+        dialect_scores.insert(DetectedDialect::MsSQL, 0.0);
+        dialect_scores.insert(DetectedDialect::MySQL, 0.0);
+        dialect_scores.insert(DetectedDialect::Oracle, 0.0);
+
+        // 🚀 HYPERTHINKING: 빠른 키워드 검색으로 성능 대폭 향상
+        for (keyword, dialect_weights) in &self.keyword_to_dialects {
+            if sql_upper.contains(keyword) {
+                for (dialect, weight) in dialect_weights {
+                    *dialect_scores.entry(dialect.clone()).or_insert(0.0) += weight;
+                }
+            }
+        }
+
+        // 가장 높은 점수의 dialect 반환
+        let (best_dialect, best_score) = dialect_scores
+            .into_iter()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .unwrap_or((DetectedDialect::Standard, 1.0));
+
+        (best_dialect, best_score)
+    }
+}
+
+fn calculate_sql_hash(sql: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    sql.hash(&mut hasher);
+    hasher.finish()
+}
 
 #[derive(Debug, Clone)]
 pub struct AnySQL {
     hyperthinking_enabled: bool,
     keyword_patterns: KeywordPatterns,
+    dialect_cache: Arc<Mutex<DialectCache>>,
+    keyword_matcher: KeywordHashMatcher,
+    performance_metrics: Arc<Mutex<PerformanceMetrics>>,
 }
 
 #[derive(Debug, Clone)]
@@ -93,6 +301,15 @@ impl AnySQL {
         Self {
             hyperthinking_enabled: true,
             keyword_patterns: KeywordPatterns::new(),
+            dialect_cache: Arc::new(Mutex::new(DialectCache::new(1000))),
+            keyword_matcher: KeywordHashMatcher::new(),
+            performance_metrics: Arc::new(Mutex::new(PerformanceMetrics {
+                total_queries: 0,
+                cache_hits: 0,
+                cache_misses: 0,
+                avg_parse_time_ns: 0,
+                dialect_accuracy: 0.0,
+            })),
         }
     }
 
@@ -124,7 +341,37 @@ impl AnySQL {
     }
 
     fn hyperthink_sql_analysis(&self, sql: &str) -> Result<SQLAnalysis, DatabaseError> {
-        let sql_upper = sql.to_uppercase();
+        let start_time = Instant::now();
+        let sql_hash = calculate_sql_hash(sql);
+
+        // 🚀 OPTIMIZATION: Check cache first
+        if let Ok(mut cache) = self.dialect_cache.lock() {
+            if let Some(cached_result) = cache.get(sql_hash) {
+                if let Ok(mut metrics) = self.performance_metrics.lock() {
+                    metrics.total_queries += 1;
+                    metrics.cache_hits += 1;
+                }
+
+                // Parse SQL with cached dialect info for faster processing
+                let sql_upper = sql.to_uppercase(); // Single conversion
+                let tokens: Vec<String> = sql_upper
+                    .split_whitespace()
+                    .map(|s| s.to_string())
+                    .collect();
+
+                let statement_type = self.determine_statement_type(&tokens)?;
+
+                return Ok(SQLAnalysis {
+                    statement_type,
+                    detected_dialect: cached_result.dialect.clone(),
+                    original_sql: sql.to_string(),
+                    tokens,
+                });
+            }
+        }
+
+        // Cache miss - perform full analysis
+        let sql_upper = sql.to_uppercase(); // Single conversion for entire function
         let tokens: Vec<String> = sql_upper
             .split_whitespace()
             .map(|s| s.to_string())
@@ -134,35 +381,26 @@ impl AnySQL {
             return Err(DatabaseError::ParseError("No tokens found".to_string()));
         }
 
-        let statement_type = match tokens[0].as_str() {
-            "CREATE" => {
-                if tokens.len() > 1 && tokens[1] == "DATABASE" {
-                    StatementType::CreateDatabase
-                } else {
-                    StatementType::CreateTable
-                }
-            }
-            "DROP" => {
-                if tokens.len() > 1 && tokens[1] == "DATABASE" {
-                    StatementType::DropDatabase
-                } else {
-                    StatementType::DropTable
-                }
-            }
-            "ALTER" => StatementType::AlterTable,
-            "INSERT" | "INSERT_INTO" => StatementType::Insert,
-            "SELECT" => StatementType::Select,
-            "UPDATE" => StatementType::Update,
-            "DELETE" => StatementType::Delete,
-            _ => {
-                return Err(DatabaseError::ParseError(format!(
-                    "Unknown statement type: {}",
-                    tokens[0]
-                )))
-            }
-        };
+        let statement_type = self.determine_statement_type(&tokens)?;
+        let (detected_dialect, confidence) = self.keyword_matcher.detect_dialect_optimized(&sql_upper);
 
-        let detected_dialect = self.detect_dialect(&sql_upper, &tokens);
+        // Cache the result
+        let processing_time = start_time.elapsed().as_nanos() as u64;
+        if let Ok(mut cache) = self.dialect_cache.lock() {
+            cache.insert(sql_hash, CachedDialectResult {
+                dialect: detected_dialect.clone(),
+                confidence_score: confidence,
+                preprocessing_time_ns: processing_time,
+                timestamp: Instant::now(),
+            });
+        }
+
+        // Update metrics
+        if let Ok(mut metrics) = self.performance_metrics.lock() {
+            metrics.total_queries += 1;
+            metrics.cache_misses += 1;
+            metrics.avg_parse_time_ns = (metrics.avg_parse_time_ns + processing_time) / 2;
+        }
 
         Ok(SQLAnalysis {
             statement_type,
@@ -172,67 +410,38 @@ impl AnySQL {
         })
     }
 
-    fn detect_dialect(&self, sql: &str, _tokens: &[String]) -> DetectedDialect {
-        let sql_upper = sql.to_uppercase();
-
-        if sql_upper.contains("VARCHAR2")
-            || sql_upper.contains("NVARCHAR2")
-            || sql_upper.contains("ROWNUM")
-            || sql_upper.contains("DUAL")
-            || sql_upper.contains("NEXTVAL")
-            || sql_upper.contains("SYSDATE")
-        {
-            return DetectedDialect::Oracle;
+    fn determine_statement_type(&self, tokens: &[String]) -> Result<StatementType, DatabaseError> {
+        if tokens.is_empty() {
+            return Err(DatabaseError::ParseError("No tokens found".to_string()));
         }
 
-        if sql_upper.contains("NVARCHAR")
-            || sql_upper.contains("IDENTITY")
-            || sql_upper.contains("UNIQUEIDENTIFIER")
-            || sql_upper.contains("DATETIME2")
-            || (sql.contains("[") && sql.contains("]"))
-        {
-            return DetectedDialect::MsSQL;
-        }
-
-        if sql_upper.contains("AUTO_INCREMENT")
-            || sql_upper.contains("LONGTEXT")
-            || sql_upper.contains("MEDIUMTEXT")
-            || sql_upper.contains("TINYTEXT")
-            || sql_upper.contains("UNSIGNED")
-            || sql.contains("`")
-        {
-            return DetectedDialect::MySQL;
-        }
-
-        let mut dialect_scores = HashMap::new();
-        dialect_scores.insert(DetectedDialect::Standard, 1);
-        dialect_scores.insert(DetectedDialect::MsSQL, 0);
-        dialect_scores.insert(DetectedDialect::MySQL, 0);
-        dialect_scores.insert(DetectedDialect::Oracle, 0);
-
-        for keyword in &self.keyword_patterns.mssql_keywords {
-            if sql_upper.contains(keyword) {
-                *dialect_scores.get_mut(&DetectedDialect::MsSQL).unwrap() += 3;
+        match tokens[0].as_str() {
+            "CREATE" => {
+                if tokens.len() > 1 && tokens[1] == "DATABASE" {
+                    Ok(StatementType::CreateDatabase)
+                } else {
+                    Ok(StatementType::CreateTable)
+                }
+            }
+            "DROP" => {
+                if tokens.len() > 1 && tokens[1] == "DATABASE" {
+                    Ok(StatementType::DropDatabase)
+                } else {
+                    Ok(StatementType::DropTable)
+                }
+            }
+            "ALTER" => Ok(StatementType::AlterTable),
+            "INSERT" | "INSERT_INTO" => Ok(StatementType::Insert),
+            "SELECT" => Ok(StatementType::Select),
+            "UPDATE" => Ok(StatementType::Update),
+            "DELETE" => Ok(StatementType::Delete),
+            _ => {
+                Err(DatabaseError::ParseError(format!(
+                    "Unknown statement type: {}",
+                    tokens[0]
+                )))
             }
         }
-
-        for keyword in &self.keyword_patterns.mysql_keywords {
-            if sql_upper.contains(keyword) {
-                *dialect_scores.get_mut(&DetectedDialect::MySQL).unwrap() += 3;
-            }
-        }
-
-        for keyword in &self.keyword_patterns.oracle_keywords {
-            if sql_upper.contains(keyword) {
-                *dialect_scores.get_mut(&DetectedDialect::Oracle).unwrap() += 3;
-            }
-        }
-
-        dialect_scores
-            .into_iter()
-            .max_by_key(|(_, score)| *score)
-            .map(|(dialect, _)| dialect)
-            .unwrap_or(DetectedDialect::Standard)
     }
 
     fn parse_create_database_anysql(&self, sql: &str) -> Result<SqlStatement, DatabaseError> {
@@ -364,7 +573,7 @@ impl AnySQL {
     }
 
     fn parse_data_type_anysql(&self, type_str: &str) -> Result<DataType, DatabaseError> {
-        let type_upper = type_str.to_uppercase();
+        let type_upper = type_str.to_uppercase(); // Single conversion per call
 
         // HYPERTHINKING: Support all dialect data types
         match type_upper.as_str() {
@@ -775,6 +984,31 @@ impl AnySQL {
         };
 
         Ok(SqlStatement::AlterTable { table_name, action })
+    }
+
+    pub fn get_performance_metrics(&self) -> Option<PerformanceMetrics> {
+        if let Ok(metrics) = self.performance_metrics.lock() {
+            Some(metrics.clone())
+        } else {
+            None
+        }
+    }
+
+    pub fn get_cache_hit_rate(&self) -> f32 {
+        if let Ok(cache) = self.dialect_cache.lock() {
+            cache.hit_rate()
+        } else {
+            0.0
+        }
+    }
+
+    pub fn clear_cache(&self) {
+        if let Ok(mut cache) = self.dialect_cache.lock() {
+            cache.cache.clear();
+            cache.access_order.clear();
+            cache.hits = 0;
+            cache.misses = 0;
+        }
     }
 }
 

@@ -201,16 +201,21 @@ fn handle_client(mut stream: TcpStream, state: Arc<ApiServerState>) {
         ("GET", "/setup/status") => Some(handle_setup_status()),
         ("POST", "/setup/init") => Some(handle_setup_init(&state, &headers, body_bytes)),
         ("POST", "/setup/complete") => Some(handle_setup_complete(&state, &headers, body_bytes)),
-        ("GET", "/query") => {
-            Some(handle_get_query_request(&state, &headers, path))
-        }
-        ("POST", "/query") | ("PUT", "/query") | ("DELETE", "/query") | ("PATCH", "/query") | ("POST", "/api/query") => {
-            Some(handle_query_request(&state, &headers, body_bytes))
-        }
         ("POST", "/2fa/setup") => Some(handle_2fa_setup(&state, &headers, body_bytes)),
         ("GET", "/2fa/qr") => Some(handle_2fa_qr(&state, &headers)),
         ("POST", "/2fa/verify") => Some(handle_2fa_verify(&state, &headers, body_bytes)),
-        _ => None,
+        _ => {
+            // Check if this is a query endpoint (any path ending with /query or containing /query)
+            if path == "/query" || path == "/api/query" || path.ends_with("/query") || path.contains("/query") {
+                match method {
+                    "GET" => Some(handle_get_query_request(&state, &headers, path)),
+                    "POST" | "PUT" | "DELETE" | "PATCH" => Some(handle_query_request(&state, &headers, body_bytes)),
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        }
     };
 
     if let Some(response) = response {

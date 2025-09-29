@@ -1,19 +1,24 @@
+use super::bloom_filter::{ColumnBloomFilter, ChunkedTableScanner, ScanStatistics};
 use super::configuration::ConfigManager;
 use super::core_types::{
     ColumnDefinition, ComparisonOperator, DatabaseError, Row, SqlStatement, SqlValue, Table,
-    WhereClause,
+    WhereClause, TableScanOptions,
 };
 use super::indexing::{IndexKey, IndexManager};
 use super::persistence::StorageEngine;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 pub struct Database {
     pub name: String,
     pub tables: HashMap<String, Table>,
     storage: StorageEngine,
     column_cache: HashMap<String, Arc<Vec<String>>>, // Pre-computed column lists per table
-    query_cache: HashMap<String, Arc<Vec<Row>>>,      // Simple query result cache
+    query_cache: HashMap<String, Arc<Vec<Row>>>,
+    bloom_filters: HashMap<String, ColumnBloomFilter>,
+    table_scan_options: TableScanOptions,
+    scan_statistics: HashMap<String, ScanStatistics>,
 }
 
 impl Database {
@@ -24,6 +29,16 @@ impl Database {
             storage: StorageEngine::new(name),
             column_cache: HashMap::new(),
             query_cache: HashMap::new(),
+
+            bloom_filters: HashMap::new(),
+            table_scan_options: TableScanOptions {
+                use_bloom_filter: true,
+                chunk_size: 1000,
+                max_memory_mb: 256,
+                enable_early_termination: true,
+                collect_statistics: true,
+            },
+            scan_statistics: HashMap::new(),
         }
     }
 
@@ -81,10 +96,19 @@ impl Database {
             storage,
             column_cache: HashMap::new(),
             query_cache: HashMap::new(),
+            bloom_filters: HashMap::new(),
+            table_scan_options: crate::core_types::TableScanOptions {
+                use_bloom_filter: true,
+                chunk_size: 10000,
+                max_memory_mb: 512,
+                enable_early_termination: true,
+                collect_statistics: true,
+            },
+            scan_statistics: HashMap::new(),
         };
 
-        // Pre-populate column cache for faster access
         db.rebuild_column_cache();
+        db.rebuild_bloom_filters();
 
         Ok(db)
     }
@@ -116,7 +140,9 @@ impl Database {
                 columns,
                 where_clause,
                 optimization_hint,
-            } => self.select_with_indexes(table_name, columns, where_clause),
+                limit,
+                offset,
+            } => self.select_with_advanced_scan(&table_name, &columns, where_clause.as_ref(), limit, offset),
             SqlStatement::Update {
                 table_name,
                 set_clauses,
@@ -661,6 +687,120 @@ impl Database {
 
     pub fn get_cache_stats(&self) -> (usize, usize) {
         (self.column_cache.len(), self.query_cache.len())
+    }
+
+    fn rebuild_bloom_filters(&mut self) {
+        self.bloom_filters.clear();
+
+        for (table_name, table) in &self.tables {
+            let mut bloom_filter = crate::bloom_filter::ColumnBloomFilter::new();
+
+            let table_data: Vec<_> = table.rows.iter()
+                .enumerate()
+                .map(|(idx, row)| (row.columns.clone(), idx))
+                .collect();
+
+            bloom_filter.build_from_table(&table_data);
+            self.bloom_filters.insert(table_name.clone(), bloom_filter);
+        }
+    }
+
+    fn select_with_advanced_scan(
+        &mut self,
+        table_name: &str,
+        columns: &[String],
+        where_clause: Option<&WhereClause>,
+        limit: Option<usize>,
+        offset: Option<usize>,
+    ) -> Result<Vec<Row>, DatabaseError> {
+        let table = self.tables.get(table_name)
+            .ok_or_else(|| DatabaseError::TableNotFound(table_name.to_string()))?;
+
+        if !self.table_scan_options.use_bloom_filter {
+            return self.select_basic(table_name, columns, where_clause, limit, offset);
+        }
+
+        let bloom_filter = self.bloom_filters.get(table_name);
+        let scanner = crate::bloom_filter::ChunkedTableScanner::new(
+            self.table_scan_options.chunk_size,
+            self.table_scan_options.max_memory_mb,
+        ).with_early_termination(self.table_scan_options.enable_early_termination);
+
+        let mut results = Vec::new();
+        let skip_count = offset.unwrap_or(0);
+        let mut current_skip = 0;
+
+        if let Some(bloom_filter) = bloom_filter {
+            let processor = |row: &Row| -> Result<Option<Row>, DatabaseError> {
+                if let Some(where_clause) = where_clause {
+                    if !self.evaluate_where_clause_optimized(row, where_clause)? {
+                        return Ok(None);
+                    }
+                }
+
+                if current_skip < skip_count {
+                    current_skip += 1;
+                    return Ok(None);
+                }
+
+                Ok(Some(self.project_columns_optimized(row, columns)))
+            };
+
+            results = scanner.scan_with_bloom_filter(
+                &table.rows,
+                bloom_filter,
+                where_clause,
+                limit,
+                processor,
+            )?;
+        } else {
+            results = self.select_basic(table_name, columns, where_clause, limit, offset)?;
+        }
+
+        if self.table_scan_options.collect_statistics {
+            println!("[MirseoDB] Advanced scan completed for table '{}': {} results",
+                     table_name, results.len());
+        }
+
+        Ok(results)
+    }
+
+    fn select_basic(
+        &self,
+        table_name: &str,
+        columns: &[String],
+        where_clause: Option<&WhereClause>,
+        limit: Option<usize>,
+        offset: Option<usize>,
+    ) -> Result<Vec<Row>, DatabaseError> {
+        let table = self.tables.get(table_name)
+            .ok_or_else(|| DatabaseError::TableNotFound(table_name.to_string()))?;
+
+        let mut results = Vec::new();
+        let skip_count = offset.unwrap_or(0);
+        let mut current_skip = 0;
+        let limit_count = limit.unwrap_or(usize::MAX);
+
+        for row in &table.rows {
+            if let Some(where_clause) = where_clause {
+                if !self.evaluate_where_clause_optimized(row, where_clause)? {
+                    continue;
+                }
+            }
+
+            if current_skip < skip_count {
+                current_skip += 1;
+                continue;
+            }
+
+            if results.len() >= limit_count {
+                break;
+            }
+
+            results.push(self.project_columns_optimized(row, columns));
+        }
+
+        Ok(results)
     }
 
     fn index_key_to_sql_value(&self, key: &IndexKey) -> Result<SqlValue, DatabaseError> {

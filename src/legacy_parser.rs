@@ -236,6 +236,8 @@ impl Parser {
             columns,
             where_clause,
             optimization_hint: None,
+            limit: None,
+            offset: None,
         })
     }
 

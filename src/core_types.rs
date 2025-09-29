@@ -58,6 +58,8 @@ pub enum SqlStatement {
         columns: Vec<String>,
         where_clause: Option<WhereClause>,
         optimization_hint: Option<QueryOptimizationHint>,
+        limit: Option<usize>,
+        offset: Option<usize>,
     },
     ComplexSelect {
         table_name: String,
@@ -202,6 +204,18 @@ pub struct QueryOptimizationHint {
     pub force_index_scan: bool,
     pub disable_optimization: bool,
     pub max_rows: Option<usize>,
+    pub enable_bloom_filter: bool,
+    pub chunk_size: Option<usize>,
+    pub early_termination: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct TableScanOptions {
+    pub use_bloom_filter: bool,
+    pub chunk_size: usize,
+    pub max_memory_mb: usize,
+    pub enable_early_termination: bool,
+    pub collect_statistics: bool,
 }
 
 #[derive(Debug, Clone)]

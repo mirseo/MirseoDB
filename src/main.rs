@@ -1,4 +1,5 @@
 mod auth;
+mod bloom_filter;
 mod configuration;
 mod core_types;
 mod engine;

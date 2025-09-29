@@ -707,11 +707,41 @@ impl AnySQL {
 
         let table_name = normalize_table_name(tokens[from_pos + 1]);
 
-        let where_clause = if let Some(where_pos) = tokens
+        let where_pos = tokens
             .iter()
-            .position(|&token| token.to_uppercase() == "WHERE")
-        {
-            Some(self.parse_where_clause_anysql(&tokens[where_pos + 1..])?)
+            .position(|&token| token.to_uppercase() == "WHERE");
+
+        let limit_pos = tokens
+            .iter()
+            .position(|&token| token.to_uppercase() == "LIMIT");
+
+        let offset_pos = tokens
+            .iter()
+            .position(|&token| token.to_uppercase() == "OFFSET");
+
+        let where_clause = if let Some(where_pos) = where_pos {
+            let where_end = limit_pos.or(offset_pos).unwrap_or(tokens.len());
+            Some(self.parse_where_clause_anysql(&tokens[where_pos + 1..where_end])?)
+        } else {
+            None
+        };
+
+        let limit = if let Some(limit_pos) = limit_pos {
+            if limit_pos + 1 < tokens.len() {
+                tokens[limit_pos + 1].parse::<usize>().ok()
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let offset = if let Some(offset_pos) = offset_pos {
+            if offset_pos + 1 < tokens.len() {
+                tokens[offset_pos + 1].parse::<usize>().ok()
+            } else {
+                None
+            }
         } else {
             None
         };
@@ -721,6 +751,8 @@ impl AnySQL {
             columns,
             where_clause,
             optimization_hint: None,
+            limit,
+            offset,
         })
     }
 

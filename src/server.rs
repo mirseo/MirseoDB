@@ -343,6 +343,22 @@ fn proxy_to_console(mut client_stream: TcpStream, request_bytes: Vec<u8>) {
     }
 }
 
+fn generate_random_auth_error() -> HttpResponse {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+
+    let error_type = (now % 4) as u8;
+
+    match error_type {
+        0 => HttpResponse::json("404 Not Found", r#"{"error":"Endpoint not found","status":404}"#.to_string()),
+        1 => HttpResponse::json("403 Forbidden", r#"{"error":"Access denied","status":403}"#.to_string()),
+        2 => HttpResponse::json("502 Bad Gateway", r#"{"error":"Service temporarily unavailable","status":502}"#.to_string()),
+        _ => HttpResponse::json("500 Internal Server Error", r#"{"error":"Internal server error","status":500}"#.to_string()),
+    }
+}
+
 fn handle_query_request(
     state: &Arc<ApiServerState>,
     headers: &HashMap<String, String>,
@@ -417,11 +433,7 @@ fn handle_query_request(
         match provided_token {
             Some(ref token) if token == expected => {}
             _ => {
-                let mut body = error_json("Invalid or missing auth token", start_time.elapsed());
-                if sanitized_applied {
-                    insert_sanitized_flag(&mut body);
-                }
-                return HttpResponse::json("401 Unauthorized", body);
+                return generate_random_auth_error();
             }
         }
     }
@@ -1806,7 +1818,7 @@ fn handle_get_query_request(
         email: None,
     };
 
-    execute_query_request(state, request, start_time, false)
+    execute_query_request(state, request, start_time, false, headers)
 }
 
 fn parse_url_query_params(query_string: &str) -> HashMap<String, String> {
@@ -1853,6 +1865,7 @@ fn execute_query_request(
     request: QueryRequest,
     start_time: Instant,
     sanitized_applied: bool,
+    headers: &HashMap<String, String>,
 ) -> HttpResponse {
     let QueryRequest {
         sql: mut sql_text,
@@ -1861,7 +1874,7 @@ fn execute_query_request(
         email: request_email,
     } = request;
 
-    let provided_token = extract_auth_token(&HashMap::new(), request_token.clone());
+    let provided_token = extract_auth_token(headers, request_token.clone());
 
     let mut sanitized_applied = sanitized_applied;
     let config = ConfigManager::load();
@@ -1877,11 +1890,7 @@ fn execute_query_request(
         match provided_token {
             Some(ref token) if token == expected => {}
             _ => {
-                let mut body = error_json("Invalid or missing auth token", start_time.elapsed());
-                if sanitized_applied {
-                    insert_sanitized_flag(&mut body);
-                }
-                return HttpResponse::json("401 Unauthorized", body);
+                return generate_random_auth_error();
             }
         }
     }

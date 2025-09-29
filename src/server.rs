@@ -194,7 +194,7 @@ fn handle_client(mut stream: TcpStream, state: Arc<ApiServerState>) {
     let headers = parse_headers(lines);
 
     let response = match (method, path) {
-        ("GET", "/health") | ("GET", "/heatlh") => {
+        ("GET", "/health") | ("GET", "/heatlh") | ("GET", "/api/health") => {
             Some(HttpResponse::json("200 OK", state.health.health_payload()))
         }
         ("GET", "/time") => Some(handle_time_request()),
@@ -283,17 +283,42 @@ fn proxy_to_console(mut client_stream: TcpStream, request_bytes: Vec<u8>) {
             };
 
             let console_to_client = thread::spawn(move || {
-                let _ = std::io::copy(&mut console_reader, &mut client_writer);
+                let mut buffer = [0u8; 8192];
+                loop {
+                    match console_reader.read(&mut buffer) {
+                        Ok(0) => break,
+                        Ok(bytes_read) => {
+                            if let Err(_) = client_writer.write_all(&buffer[..bytes_read]) {
+                                break;
+                            }
+                        }
+                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(1));
+                            continue;
+                        }
+                        Err(_) => break,
+                    }
+                }
             });
 
             let mut client_reader = client_stream;
             let mut console_writer = console_stream;
+            let mut buffer = [0u8; 8192];
 
-            if let Err(err) = std::io::copy(&mut client_reader, &mut console_writer) {
-                eprintln!(
-                    "[MirseoDB][console-proxy] Error while piping client to console: {}",
-                    err
-                );
+            loop {
+                match client_reader.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(bytes_read) => {
+                        if let Err(_) = console_writer.write_all(&buffer[..bytes_read]) {
+                            break;
+                        }
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(1));
+                        continue;
+                    }
+                    Err(_) => break,
+                }
             }
 
             let _ = console_writer.shutdown(Shutdown::Write);
